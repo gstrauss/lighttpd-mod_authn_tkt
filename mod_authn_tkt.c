@@ -1,1523 +1,1153 @@
-/* 
-   mod_auth_tkt - a cookie-based authentification for Lighttpd
-
-   author: Mars Agliullin griph <at> mail <dot> ru
-   based on: mod_auth_tkt by Gavin Carr with contributors 
-	     (see http://www.openfusion.com.au/labs/mod_auth_tkt),
-   license: BSD 
- */ 
-#include <sys/types.h>
-#include <sys/stat.h>
+/*
+ * mod_authn_tkt - a cookie-based authentification for Lighttpd
+ *
+ * lighttpd module
+ *   Copyright Glenn Strauss gstrauss@gluelogic.com
+ *   License: BSD 3-clause + see below
+ *
+ * based on: mod_auth_tkt by Gavin Carr with contributors
+ *           (see http://www.openfusion.com.au/labs/mod_auth_tkt),
+ *           https://github.com/gavincarr/mod_auth_tkt
+ *           License: Apache License 1.0
+ */
+#include "first.h"
 
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <assert.h>
+#include <time.h>
 
 #include "base.h"
+#include "base64.h"
 #include "buffer.h"
-#include "plugin.h"
+#include "md5.h"
 #include "http_auth.h"
+#include "http_header.h"
 #include "log.h"
+#include "plugin.h"
+#include "rand.h"
 #include "response.h"
-#include "http_auth_digest.h"
-
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
-#ifdef USE_OPENSSL
-# include <openssl/md5.h>
-#else
-# include "md5.h"
-#endif
 
 /* Default settings */
 #define AUTH_COOKIE_NAME "auth_tkt"
-#define BACK_ARG_NAME "back"
-#define MD5_DIGEST_SZ 32
-#define MD5andTSTAMP (MD5_DIGEST_SZ + 8)
 #define SEPARATOR '!'
-#define SEPARATOR_HEX "%21"
-#define REMOTE_USER_ENV "REMOTE_USER"
-#define REMOTE_USER_DATA_ENV "REMOTE_USER_DATA"
-#define REMOTE_USER_TOKENS_ENV "REMOTE_USER_TOKENS"
 #define DEFAULT_TIMEOUT_SEC 7200
 #define DEFAULT_GUEST_USER "guest"
 
-#define FORCE_REFRESH 1
-#define CHECK_REFRESH 0
+#ifndef MD5_DIGEST_LENGTH
+#define MD5_DIGEST_LENGTH 16
+#endif
+
+#ifdef USE_OPENSSL_CRYPTO
+#include <openssl/sha.h>
+#define MAX_DIGEST_LENGTH SHA512_DIGEST_LENGTH
+#else
+#define MAX_DIGEST_LENGTH MD5_DIGEST_LENGTH
+#endif
+
+#define TIMESTAMP_HEXLEN 8  /*(assumes 32-bit time_t)*/
+
+#define TIME_T_MAX (~((time_t)1 << (sizeof(time_t)*CHAR_BIT-1)))
+
+
+typedef struct authn_tkt_struct {
+	buffer *uid;
+	buffer *tokens;
+	buffer *user_data;
+	buffer *tmp_buf;
+	buffer *addr_buf; /* not allocated */
+	int refresh_cookie;
+	time_t timestamp;
+	unsigned int digest_len;
+        void (*digest_fn)(struct authn_tkt_struct *, time_t, const buffer *);
+	unsigned char digest[MAX_DIGEST_LENGTH];
+} authn_tkt;
+
 
 typedef struct {
-	array  *auth_require;
-
 	buffer *auth_secret;
+	buffer *auth_secret_old;
 	buffer *auth_login_url;
 	buffer *auth_timeout_url;
 	buffer *auth_post_timeout_url;
 	buffer *auth_unauth_url;
 
-	buffer *auth_guest_user;
 	buffer *auth_timeout_conf;
 	buffer *auth_timeout_refresh_conf;
 	buffer *auth_cookie_name;
-	buffer *auth_domain;
+	buffer *auth_cookie_domain;
 	buffer *auth_cookie_expires_conf;
-	buffer *auth_back_arg_name;
 	buffer *auth_back_cookie_name;
+	buffer *auth_back_arg_name;
+	buffer *auth_digest_type_conf;
+	buffer *auth_guest_user;
+	array *auth_tokens;
 
+        void (*auth_digest_fn)(struct authn_tkt_struct *,time_t,const buffer *);
+	unsigned short auth_digest_len;
+	short auth_ignore_ip;
+	short auth_cookie_secure;
+	short auth_require_ssl;
 	short auth_guest_login;
 	short auth_guest_cookie;
-	short auth_ignore_ip;
-	short auth_require_ssl;
-	short auth_cookie_secure;
+	short auth_guest_fallback;
 
-	short auth_debug;
-
-	/* induced elements */
+	/* generated from user config strings */
 	int auth_timeout;
-	double auth_timeout_refresh;
+	int auth_timeout_refresh;
 	int auth_cookie_expires;
-} mod_auth_tkt_plugin_config;
+} mod_authn_tkt_plugin_opts;
 
 
 typedef struct {
-	PLUGIN_DATA;    
-
-	mod_auth_tkt_plugin_config **config_storage;
-	
-	mod_auth_tkt_plugin_config conf; /* this is only used as long as no handler_ctx is setup */
-} mod_auth_tkt_plugin_data;
+	mod_authn_tkt_plugin_opts *auth_opts;
+} mod_authn_tkt_plugin_config;
 
 
-typedef struct auth_tkt_struct {
-	buffer *uid;
-	buffer *tokens;
-	buffer *user_data;
-	time_t timestamp;
-} auth_tkt;
+typedef struct {
+	PLUGIN_DATA;
+	mod_authn_tkt_plugin_config **config_storage;
+	mod_authn_tkt_plugin_config conf;
+	authn_tkt auth_rec;
+} mod_authn_tkt_plugin_data;
 
 
-INIT_FUNC(mod_auth_tkt_init) /*{{{*/
+static handler_t mod_authn_tkt_check(server *srv, connection *con, void *p_d, const struct http_auth_require_t *require, const struct http_auth_backend_t *backend);
+
+INIT_FUNC(mod_authn_tkt_init) /*{{{*/
 {
-	mod_auth_tkt_plugin_data *p;
-	
-	p = calloc(1, sizeof(*p));
-	
-	return p;
+    static http_auth_scheme_t http_auth_scheme_authn_tkt = { "authn_tkt", mod_authn_tkt_check, NULL };
+
+    mod_authn_tkt_plugin_data *p = calloc(1, sizeof(*p));
+
+    /* register http_auth_scheme_* */
+    http_auth_scheme_authn_tkt.p_d = p;
+    http_auth_scheme_set(&http_auth_scheme_authn_tkt);
+
+    p->auth_rec.uid = buffer_init();
+    p->auth_rec.tokens = buffer_init();
+    p->auth_rec.user_data = buffer_init();
+    p->auth_rec.tmp_buf = buffer_init();
+    return p;
 }/*}}}*/
 
-FREE_FUNC(mod_auth_tkt_free) /*{{{*/
+FREE_FUNC(mod_authn_tkt_free) /*{{{*/
 {
-	mod_auth_tkt_plugin_data *p = p_d;
-	
+	mod_authn_tkt_plugin_data *p = p_d;
+
 	UNUSED(srv);
 
 	if (!p) return HANDLER_GO_ON;
-	
+
 	if (p->config_storage) {
 		size_t i;
 		for (i = 0; i < srv->config_context->used; i++) {
-			mod_auth_tkt_plugin_config *s = p->config_storage[i];
-			
-			if (!s) continue;
-			
-			array_free(s->auth_require);
-			buffer_free(s->auth_secret);
-			buffer_free(s->auth_login_url);
-			buffer_free(s->auth_timeout_url);
-			buffer_free(s->auth_post_timeout_url);
-			buffer_free(s->auth_unauth_url);
+			mod_authn_tkt_plugin_config *s = p->config_storage[i];
 
-			buffer_free(s->auth_guest_user);
-			buffer_free(s->auth_timeout_conf);
-			buffer_free(s->auth_timeout_refresh_conf);
-			buffer_free(s->auth_cookie_name);
-			buffer_free(s->auth_domain);
-			buffer_free(s->auth_cookie_expires_conf);
-			buffer_free(s->auth_back_arg_name);
-			buffer_free(s->auth_back_cookie_name);
-			
+			if (!s) continue;
+
+			if (s->auth_opts) {
+				mod_authn_tkt_plugin_opts *o = s->auth_opts;
+				buffer_free(o->auth_secret);
+				buffer_free(o->auth_secret_old);
+				buffer_free(o->auth_login_url);
+				buffer_free(o->auth_timeout_url);
+				buffer_free(o->auth_post_timeout_url);
+				buffer_free(o->auth_unauth_url);
+				buffer_free(o->auth_timeout_conf);
+				buffer_free(o->auth_timeout_refresh_conf);
+				buffer_free(o->auth_digest_type_conf);
+				buffer_free(o->auth_cookie_name);
+				buffer_free(o->auth_cookie_domain);
+				buffer_free(o->auth_cookie_expires_conf);
+				buffer_free(o->auth_back_cookie_name);
+				buffer_free(o->auth_back_arg_name);
+				buffer_free(o->auth_guest_user);
+				array_free(o->auth_tokens);
+				free(o);
+			}
+
 			free(s);
 		}
 		free(p->config_storage);
 	}
-	
+
+	buffer_free(p->auth_rec.uid);
+	buffer_free(p->auth_rec.tokens);
+	buffer_free(p->auth_rec.user_data);
+	buffer_free(p->auth_rec.tmp_buf);
+
 	free(p);
-	
+
 	return HANDLER_GO_ON;
 }/*}}}*/
 
 #define PATCH(x) \
 	p->conf.x = s->x;
-static int mod_auth_tkt_patch_connection(server *srv, connection *con, mod_auth_tkt_plugin_data *p) /*{{{*/
+static int mod_authn_tkt_patch_connection(server *srv, connection *con, mod_authn_tkt_plugin_data *p) /*{{{*/
 {
-	size_t i, j;
-	mod_auth_tkt_plugin_config *s = p->config_storage[0];
+	mod_authn_tkt_plugin_config *s = p->config_storage[0];
+	PATCH(auth_opts);
 
-	PATCH(auth_require);
-	PATCH(auth_secret);
-	PATCH(auth_login_url);
-	PATCH(auth_timeout_url);
-	PATCH(auth_post_timeout_url);
-	PATCH(auth_unauth_url);
-	PATCH(auth_guest_user);
-	PATCH(auth_cookie_name);
-	PATCH(auth_domain);
-	PATCH(auth_back_arg_name);
-	PATCH(auth_back_cookie_name);
-	PATCH(auth_guest_login);
-	PATCH(auth_guest_cookie);
-	PATCH(auth_ignore_ip);
-	PATCH(auth_require_ssl);
-	PATCH(auth_cookie_secure);
-	PATCH(auth_debug);
-	PATCH(auth_timeout);
-	PATCH(auth_timeout_refresh);
-	PATCH(auth_cookie_expires);
-	
 	/* skip the first, the global context */
-	for (i = 1; i < srv->config_context->used; i++) {
+	for (size_t i = 1; i < srv->config_context->used; ++i) {
 		data_config *dc = (data_config *)srv->config_context->data[i];
 		s = p->config_storage[i];
-		
+
 		/* condition didn't match */
 		if (!config_check_cond(srv, con, dc)) continue;
-		
+
 		/* merge config */
-		for (j = 0; j < dc->value->used; j++) {
+		for (size_t j = 0; j < dc->value->used; ++j) {
 			data_unset *du = dc->value->data[j];
-			
-			if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.require"))) {
-				PATCH(auth_require);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.secret"))) {
-				PATCH(auth_secret);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.login_url"))) {
-				PATCH(auth_login_url);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.timeout_url"))) {
-				PATCH(auth_timeout_url);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.post_timeout_url"))) {
-				PATCH(auth_post_timeout_url);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.unauth_url"))) {
-				PATCH(auth_unauth_url);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.guest_user"))) {
-				PATCH(auth_guest_user);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.cookie_name"))) {
-				PATCH(auth_cookie_name);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.domain"))) {
-				PATCH(auth_domain);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.back_arg_name"))) {
-				PATCH(auth_back_arg_name);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.back_cookie_name"))) {
-				PATCH(auth_back_cookie_name);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.guest_login"))) {
-				PATCH(auth_guest_login);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.guest_cookie"))) {
-				PATCH(auth_guest_cookie);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.ignore_ip"))) {
-				PATCH(auth_ignore_ip);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.require_ssl"))) {
-				PATCH(auth_require_ssl);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.cookie_secure"))) {
-				PATCH(auth_cookie_secure);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.debug"))) {
-				PATCH(auth_debug);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.timeout"))) {
-				PATCH(auth_timeout);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.timeout_refresh"))) {
-				PATCH(auth_timeout_refresh);
-			} else if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth_tkt.cookie_expires"))) {
-				PATCH(auth_cookie_expires);
+
+			if (buffer_is_equal_string(du->key, CONST_STR_LEN("auth.method.tkt.opts"))) {
+				PATCH(auth_opts);
 			}
 		}
 	}
-	
+
 	return 0;
 }/*}}}*/
 #undef PATCH
 
-static const char base64_pad = '=';
-
-static const char base64_table[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static const short base64_reverse_table[256] = {
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1, -1, 63,
-                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1,
-                -1,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
-                15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1,
-                -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
-                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
-};
-
-static int buffer_base64_encode(buffer *buf_in, buffer *buf_out)/*{{{*/
+/* Send an auth cookie with given value; NULL value is flag to expire cookie */
+static void send_auth_cookie(connection *con, mod_authn_tkt_plugin_opts *opts, const buffer *cookie_name, const buffer *value, time_t now)/*{{{*/
 {
-    char *in = buf_in->ptr, *out;
-    int len = buf_in->used;
-    buffer_prepare_copy(buf_out, len*4/3 + 6);
-    out = buf_out->ptr;
-
-    for (; len >= 3; len -= 3)
-    {
-        *out++ = base64_table[in[0] >> 2];
-        *out++ = base64_table[((in[0] << 4) & 0x30) | (in[1] >> 4)];
-        *out++ = base64_table[((in[1] << 2) & 0x3c) | (in[2] >> 6)];
-        *out++ = base64_table[in[2] & 0x3f];
-        in += 3;
-    }
-    if (len > 0)
-    {
-        unsigned char fragment;
-    
-        *out++ = base64_table[in[0] >> 2];
-        fragment = (in[0] << 4) & 0x30;
-        if (len > 1)
-            fragment |= in[1] >> 4;
-        *out++ = base64_table[fragment];
-        *out++ = (len < 2) ? '=' : base64_table[(in[1] << 2) & 0x3c];
-        *out++ = '=';
-    }
-    *out++ = '\0';
-    buf_out->used = out - buf_out->ptr;
-
-    return 0;
-}/*}}}*/
-
-static int buffer_base64_decode(buffer *b) {/*{{{*/
-        const char *src;
-        char *dst;
-    
-        int ch;
-        size_t i;
-        
-	if (!b || !b->ptr) return -1;
-
-        src = (const char*) b->ptr;
-        dst = (char*) b->ptr;
-
-        ch = *src;
-        /* run through the whole string, converting as we proceed */
-	for (i = 0; (*src) != '\0'; i++, src++) {
-	    ch = *src;
-
-	    if (ch == base64_pad) break;
-
-	    ch = base64_reverse_table[ch];
-	    if (ch < 0) continue;
-
-	    switch(i & 0x3) {
-	    case 0:
-		    *dst = ch << 2;
-		    break;
-	    case 1:
-		    *dst++ |= ch >> 4;
-		    *dst = (ch & 0x0f) << 4;
-		    break;
-	    case 2:
-		    *dst++ |= ch >> 2;
-		    *dst = (ch & 0x03) << 6;
-		    break;
-	    case 3:
-		    *dst++ |= ch;
-		    break;
-	    }
-	}
-        /* mop things up if we ended on a boundary */
-        if (ch == base64_pad) {
-                switch(i & 0x3) {
-                case 0:
-                case 1:
-                        return -1;
-                case 2:
-                        dst++;
-                case 3:
-			*dst++ = '\0';
-                }
-        }
-        *dst = '\0';
-        b->used = (dst - b->ptr) + 1;
-	return 0;
-}/*}}}*/
-
-/* Send an auth cookie with the given value */
-static void send_auth_cookie(server *srv, connection *con, mod_auth_tkt_plugin_config *cfg, const char *cookie_name, buffer *value)/*{{{*/
-{
-    data_string *ds;
     buffer *cookie;
-    buffer *domain = buffer_is_empty(cfg->auth_domain) ? con->server_name : cfg->auth_domain;
-    char exp_date[256];
-    time_t now = time(NULL);
+    buffer *domain;
 
-    if (NULL == (ds = (data_string *)array_get_unused_element(con->response.headers, TYPE_STRING))) {
-	    ds = data_response_init();
-    }
-    buffer_copy_string(ds->key, "Set-Cookie");
-    cookie = ds->value;
+    http_header_response_insert(con, HTTP_HEADER_SET_COOKIE,
+                                CONST_STR_LEN("Set-Cookie"),
+                                CONST_BUF_LEN(cookie_name));
+    cookie = http_header_response_get(con, HTTP_HEADER_SET_COOKIE,
+                                      CONST_STR_LEN("Set-Cookie"));
+  #ifdef __COVERITY__
+    force_assert(cookie);
+  #endif
 
-    buffer_copy_string(cookie, cookie_name);
-    buffer_append_string(cookie, "=");
-    buffer_append_string_buffer(cookie, value);
-    buffer_append_string(cookie, "; path=/");
-    if (domain->used) {
-	buffer_append_string(cookie, "; domain=");
-	buffer_append_string_encoded(cookie, CONST_BUF_LEN(domain), ENCODING_REL_URI);
+    if (NULL != value) {
+        buffer_append_string_len(cookie, "=", 1);
+        buffer_append_string_buffer(cookie, value);
+        buffer_append_string_len(cookie, CONST_STR_LEN("; path=/"));
+        if (opts->auth_cookie_expires > 0) {
+            now = (TIME_T_MAX - now > opts->auth_cookie_expires)
+                ? now + opts->auth_cookie_expires
+                : TIME_T_MAX;
+            buffer_append_string_len(cookie, CONST_STR_LEN("; expires="));
+            buffer_append_strftime(cookie, "%a, %d %b %Y %H:%M:%S GMT",
+                                   gmtime(&now));
+        }
     }
-    if (cfg->auth_cookie_expires > 0) {
-	now += cfg->auth_cookie_expires;
-	strftime(exp_date, 255, "%a, %d %b %Y %H:%M:%S +0000", gmtime(&now));
-	buffer_append_string(cookie, "; expires=");
-	buffer_append_string(cookie, exp_date);
+    else {
+        buffer_append_string_len(cookie,
+          CONST_STR_LEN("=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT"));
     }
-    if (cfg->auth_cookie_secure > 0) {
-	buffer_append_string(cookie, "; secure");
+    /* (Apache mod_authn_tkt prefers X-Forwarded-Host to Host; not done here) */
+    /* XXX: if using con->server_name, do we need to omit :port, if present? */
+    domain = buffer_string_is_empty(opts->auth_cookie_domain)
+      ? con->server_name
+      : opts->auth_cookie_domain;
+    if (!buffer_string_is_empty(domain)) {
+        buffer_append_string_len(cookie, CONST_STR_LEN("; domain="));
+        buffer_append_string_encoded(cookie, CONST_BUF_LEN(domain),
+                                     ENCODING_REL_URI);
     }
-    if (cfg->auth_debug) {
-	log_error_write(srv, __FILE__, __LINE__, "b", cookie);
+    if (opts->auth_cookie_secure > 0) {
+        buffer_append_string_len(cookie, CONST_STR_LEN("; secure"));
     }
-    array_insert_unique(con->response.headers, (data_unset *)ds);
+}/*}}}*/
+
+static int digest_hex_to_bin(unsigned char *out, size_t outlen, const char *in, size_t inlen)/*{{{*/
+{
+    if ((outlen << 1) != inlen) return 0;
+
+    for (size_t i = inlen; i < inlen; i+=2) {
+        unsigned char hi = (unsigned char)hex2int(((unsigned char *)in)[i]);
+        unsigned char lo = (unsigned char)hex2int(((unsigned char *)in)[i+1]);
+        if (hi == 0xFF) return 0; /*(invalid hex encoding)*/
+        if (lo == 0xFF) return 0; /*(invalid hex encoding)*/
+        out[(i >> 1)] = (hi << 4) | lo;
+    }
+    return 1;
 }/*}}}*/
 
 /* Parse cookie. Returns 1 if valid, and details in *parsed; 0 if not */
-static int parse_ticket(server *srv, mod_auth_tkt_plugin_config *cfg, buffer *ticket, auth_tkt *parsed)/*{{{*/
+static int parse_ticket(authn_tkt *parsed)/*{{{*/
 {
-	char *tkt = ticket->ptr, *sep, *sep2;
-	int len = ticket->used;
-  
-	/* Basic length check for min size */
-	if (len <= MD5andTSTAMP) return 0; 
+    const char *tkt = parsed->tmp_buf->ptr, *sep, *sep2;
+    const unsigned int digest_hexlen = (parsed->digest_len << 1);
 
-	/* See if there is a uid/data separator */
-	sep = strchr(tkt, SEPARATOR);
-	if (NULL == sep) {	
-	    /* Ticket either uri-escaped, base64-escaped, or bogus */
-	    if (strstr(tkt, SEPARATOR_HEX)) {
-		if (cfg->auth_debug) {
-		    log_error_write(srv, __FILE__, __LINE__, "s", 
-				"mod_auth_tkt: url encoded ticket");
-		}
-		buffer_urldecode_path(ticket);
-		sep = strchr(tkt, SEPARATOR);
-	    } else {
-		if (cfg->auth_debug) {
-		    log_error_write(srv, __FILE__, __LINE__, "s", 
-				"mod_auth_tkt: base64 encoded ticket");
-		}
-		/* base64 encoded string always longer than original, 
-		   so len+1 is sufficient */
-		buffer_base64_decode(ticket);
-		sep = strchr(tkt, SEPARATOR);
-		/* If still no separator, must be bogus */
-		if (NULL == sep) return 0;
-	    }
-	    /* Reset len */
-	    len = ticket->used;
-	}
+    /* See if there is a uid/data separator */
+    sep = strchr(tkt, SEPARATOR);
+    if (NULL == sep) return 0;
 
-	/* Recheck length */
-	if (len <= MD5andTSTAMP || sep-tkt < MD5andTSTAMP) return 0; 
+    /* Basic length check for min size */
+    if (sep - tkt < digest_hexlen + TIMESTAMP_HEXLEN) return 0;
 
-	if (cfg->auth_debug) {
-	    log_error_write(srv, __FILE__, __LINE__, "ss", 
-		    "mod_auth_tkt: parse_ticket decoded ticket", tkt);
-	}
-
-	/* Get user id */
-	len = sep - tkt - MD5andTSTAMP;
-	buffer_copy_string_len(parsed->uid, tkt + MD5andTSTAMP, len);
-	if (cfg->auth_debug) {
-	    log_error_write(srv, __FILE__, __LINE__, "b", parsed->uid);
-	}
-
-	/* Check for tokens */
-	sep2 = strchr(sep+1, SEPARATOR);
-	if (NULL == sep2) {
-		if (cfg->auth_debug) {
-			log_error_write(srv, __FILE__, __LINE__, "s", 
-					"mod_auth_tkt: ticket has no tokens");
-		}
-	} else {
-		/* Copy tokens to parsed->tokens */
-		buffer_copy_string_len(parsed->tokens, sep+1, sep2-sep-1);
-		if (cfg->auth_debug) {
-			log_error_write(srv, __FILE__, __LINE__, "sb", 
-			    "mod_auth_tkt: parse_ticket tokens - ", parsed->tokens);
-		}
-		sep = sep2;
-	}
-
-	/* Copy user data to parsed->user_data */
-	buffer_copy_string(parsed->user_data, sep+1);
-
-	/* Copy timestamp to parsed->timestamp */
-	sscanf(tkt+MD5_DIGEST_SZ, "%8x", &(parsed->timestamp));
-
-	return 1;
-}/*}}}*/
-
-
-/* Search cookie headers for our ticket */
-static int cookie_match(server *srv, const mod_auth_tkt_plugin_config *cfg, 
-	const buffer *cookie, const char *cookie_name, const int cookie_name_len, buffer *result)/*{{{*/
-{
-    char *start, *end;
-
-    if (cfg->auth_debug) {
-	    log_error_write(srv, __FILE__, __LINE__, "sssb",
-		    "mod_auth_tkt: cookie_match, key", cookie_name, 
-		    "against", cookie);
+    if (!digest_hex_to_bin(parsed->digest, sizeof(parsed->digest),
+                           tkt, digest_hexlen)) {
+        return 0; /*(invalid hex encoding)*/
     }
 
-    start = cookie->ptr;
-    while ((start = strstr(start, cookie_name))) {
-	    start += cookie_name_len;
-	    if (*start != '=') continue;
-	    start++;
-	    /* Cookie includes our cookie_name - copy (first) value into result */
-	    end = strchr(start, ';');
-
-	    /* For some reason (some clients?), tickets sometimes come in quoted */
-	    if (*start == '"') start++;
-
-	    if (end) {
-		    /* end points at ';' we will not copy it! */
-		    if (end[-1] == '"') end--;
-		    buffer_copy_string_len(result, start, end-start);
-	    } else {
-		    if (cookie->ptr[cookie->used-1] == '"') {
-			    end = &(cookie->ptr[cookie->used-1]);
-			    /* don't copy quote */
-			    buffer_copy_string_len(result, start, end-start);
-		    } else {
-			    buffer_copy_string(result, start);
-		    }
-	    }
-	    /* Skip empty cookies (such as with misconfigured logoffs) */
-	    if (!buffer_is_empty(result)) {
-		    if (cfg->auth_debug) {
-			    log_error_write(srv, __FILE__, __LINE__, "sb", 
-					    "mod_auth_tkt: cookie_match found ", result);
-		    }
-		    return 1;
-	    }
+    parsed->timestamp = 0;
+    if (!digest_hex_to_bin((unsigned char *)&parsed->timestamp,
+                           sizeof(parsed->timestamp),
+                           tkt+digest_hexlen,
+                           TIMESTAMP_HEXLEN)) {
+        return 0; /*(invalid hex encoding in timestamp)*/
     }
 
-    if (cfg->auth_debug) {
-      log_error_write(srv, __FILE__, __LINE__, "s",
-		      "mod_auth_tkt: match NOT found");
-    }
-    return 0;
-}/*}}}*/
+    buffer_copy_string_len(parsed->uid,
+                           tkt + digest_hexlen + TIMESTAMP_HEXLEN,
+                           sep - tkt - (digest_hexlen + TIMESTAMP_HEXLEN));
 
-/* Strip specified query args from a url */
-static buffer *query_strip(buffer *query, buffer *strip)/*{{{*/
-{
-	buffer *new_args = buffer_init_buffer(query);
-	char *b, *e;
-
-	assert(new_args);
-	if (buffer_is_empty(new_args)) return new_args;
-
-#if 0
-	b = new_args->ptr;
-	/* Convert all '&' to ';' */
-	while ((b = strchr(b, '&'))) 
-		*b = ';';
-#endif
-
-	b = new_args->ptr;
-	while (1) {
-		/* inv: b points to the key */
-		e = strchr(b, '=');
-		if (NULL == e) break;
-
-		if (e - b == strip->used && 0 == strncmp(b, strip->ptr, strip->used-1)) {
-			/* strip this key-value pair */
-			e = strchr(e+1, '&');
-			if (e) {
-				e++;
-				/* shift query tail towards the beginnig thus overwriting the pair */
-				memmove(b, e, new_args->used - (e - new_args->ptr));
-				new_args->used -= e - b;
-			} else {
-				if (b == new_args->ptr) {
-					buffer_reset(new_args);
-				} else {
-					*(b-1) = '\0';
-					new_args->used = b - new_args->ptr - 1;
-				}
-				break;
-			}
-		} else {
-			/* go to the next pair */
-			b = strchr(e+1, '&');
-			if (b) b++;
-			else break;
-		}
-	}
-	return new_args;
-}/*}}}*/
-
-/* External redirect to the given url, setting back cookie or arg */
-static void redirect(server *srv, connection *con, mod_auth_tkt_plugin_config *cfg, buffer *location)/*{{{*/
-{
-	buffer *domain = buffer_is_empty(cfg->auth_domain) ? con->server_name : cfg->auth_domain;
-	buffer *back_cookie_name = cfg->auth_back_cookie_name;
-	buffer *back_arg_name = cfg->auth_back_arg_name;
-	buffer *url, *cookie, *back;
-	data_string *ds = NULL;
-	buffer *hostinfo; 
-	unsigned short port;
-	int free_hostinfo = 0, free_url = 0;
-	char buf[8];
-
-	/* Get the scheme we use (http or https) */
-	buffer *scheme = con->uri.scheme;
-
-	/* Strip any auth_cookie_name arguments from the current args */
-	buffer *query = query_strip(con->uri.query, cfg->auth_cookie_name);
-
-	/* Build back URL */
-	/* Use Host header for host:port info if available */
-	ds = (data_string *)array_get_element(con->request.headers, "Host");
-	if (ds && !buffer_is_empty(ds->value)) {
-		hostinfo = ds->value;
-	} else {
-		/* Fallback to using configured hostname and the server port. This usually
-		works, but behind a reverse proxy the port may well be wrong. 
-		On the other hand, it's really the proxy's problem, not ours.  */
-		if (cfg->auth_debug) {
-		    log_error_write(srv, __FILE__, __LINE__, "s",
-				    "mod_auth_tkt: could not find Host header, falling back to hostname/server port");
-		}
-		port = srv->srvconf.port;
-		if (port == (con->conf.is_ssl ? 443 : 80)) {
-			hostinfo = con->server_name;
-		} else {
-			hostinfo = buffer_init_buffer(con->server_name);
-			sprintf(buf, ":%u", port);
-			buffer_append_string(hostinfo, buf);
-			free_hostinfo = 1;
-		}
-	}
-	back = buffer_init_buffer(scheme);
-	buffer_append_string(back, "://");
-	buffer_append_string_encoded(back, hostinfo->ptr, hostinfo->used-1, ENCODING_REL_URI_PART);
-	buffer_append_string_encoded(back, con->uri.path->ptr, con->uri.path->used-1, ENCODING_REL_URI_PART);
-	if (query->used) {
-	    buffer_append_string(back, "?");
-	    buffer_append_string_encoded(back, query->ptr, query->used-1, ENCODING_REL_URI_PART);
-	}
-
-	if (cfg->auth_debug >= 1) {
-		log_error_write(srv, __FILE__, __LINE__, "sb", 
-				"mod_auth_tkt: back url ", back);
-	}
-  
-	if (buffer_is_empty(back_cookie_name)) {
-		/* If back_cookie_name not set, add a back url argument to url */
-		char *sep = strchr(location->ptr, '?') ? ";" : "?";
-		url = buffer_init_buffer(location);
-		buffer_append_string(url, sep);
-		buffer_append_string_buffer(url, back_arg_name);
-		buffer_append_string(url, "=");
-		buffer_append_string_buffer(url, back);
-		free_url = 1;
-	} else {
-		if (NULL == (ds = (data_string *)array_get_unused_element(con->response.headers, TYPE_STRING))) {
-			ds = data_response_init();
-		}
-		buffer_copy_string(ds->key, "Set-Cookie");
-		cookie = ds->value;
-		buffer_copy_string_buffer(cookie, back_cookie_name);
-		buffer_append_string(cookie, "=");
-		buffer_append_string_buffer(cookie, back);
-
-		if (buffer_is_empty(domain)) {
-		    buffer_append_string(cookie, "; path=/");
-		} else {
-		    buffer_append_string(cookie, "; path=/; domain=");
-		    buffer_append_string_buffer(cookie, domain);
-		}
-		array_insert_unique(con->response.headers, (data_unset *)ds);
-		url = location;
-	}
-
-	if (cfg->auth_debug >= 2) {
-		log_error_write(srv, __FILE__, __LINE__, "sb",
-				"mod_auth_tkt: redirect ", url);
-	}
-
-	response_header_insert(srv, con, CONST_STR_LEN("Location"), CONST_BUF_LEN(url));
-
-	con->http_status = 302;
-	con->file_finished = 1;
-
-	if (free_hostinfo) buffer_free(hostinfo);
-	if (free_url) buffer_free(url);
-	buffer_free(query);
-}/*}}}*/
-
-#if 0
-/* Look for an url ticket */
-static char *get_url_ticket(server *srv, buffer *query)/*{{{*/
-{
-	char *ticket = NULL;
-
-	/* TODO */
-
-  return ticket;
-}
-#endif
-
-static void init_auth_rec(auth_tkt *r)/*{{{*/
-{
-	r->uid = buffer_init();
-	r->tokens = buffer_init();
-	r->user_data = buffer_init();
-	r->timestamp = 0;
-}/*}}}*/
-
-static void free_auth_rec(auth_tkt *r) /*{{{*/
-{
-	buffer_free(r->uid);
-	buffer_free(r->tokens);
-	buffer_free(r->user_data);
-}/*}}}*/
-
-/* Generate a ticket digest string from the given details */
-/* return 0 on error, 1 if OK */
-static int ticket_digest(server *srv, connection *con,
-	mod_auth_tkt_plugin_config *cfg, auth_tkt *parsed, 
-	unsigned int timestamp, char *digest)/*{{{*/
-{
-    buffer *secret = cfg->auth_secret;
-    buffer *uid = parsed->uid;
-    buffer *tokens = parsed->tokens;
-    buffer *user_data = parsed->user_data;
-
-    buffer *remote_ip;
-    unsigned long ip;
-    HASH Hash;
-    MD5_CTX Md5Ctx;    
-
-    /* TODO: IPv6 support */
-    ip = con->dst_addr.ipv4.sin_addr.s_addr;
-    if (ip == INADDR_NONE) return 0;
-
-    if (timestamp == 0) timestamp = parsed->timestamp;
-
-    remote_ip = cfg->auth_ignore_ip > 0 
-			    ? buffer_init_string("0.0.0.0")
-			    : buffer_init_buffer(con->dst_addr_buf);
-
-#if 0
-    if (cfg->auth_debug) {
-	log_error_write(srv, __FILE__, __LINE__, "sbsbsd",
-	    "TKT ticket_digest: using md5 key", secret, "ip", remote_ip, "ts", timestamp);
-    }
-#endif
-
-    /* Generate the initial digest */
-    MD5_Init(&Md5Ctx);
-    MD5_Update(&Md5Ctx, (unsigned char *)&ip, sizeof(ip));
-    timestamp = htonl(timestamp);
-    MD5_Update(&Md5Ctx, (unsigned char *)&timestamp, sizeof(timestamp));
-    MD5_Update(&Md5Ctx, (unsigned char *)secret->ptr, secret->used - 1);
-    MD5_Update(&Md5Ctx, (unsigned char *)uid->ptr, uid->used); /* terminating NUL included */
-    if (0 == tokens->used)
-	MD5_Update(&Md5Ctx, (unsigned char *)"", 1);
-    else
-	MD5_Update(&Md5Ctx, (unsigned char *)tokens->ptr, tokens->used); /* terminating NUL included */
-    if (user_data->used) {
-	MD5_Update(&Md5Ctx, (unsigned char *)user_data->ptr, user_data->used - 1);
-    }
-    MD5_Final(Hash, &Md5Ctx);
-    CvtHex(Hash, digest);
-
-    if (cfg->auth_debug) {
-	log_error_write(srv, __FILE__, __LINE__, "ss", 
-		"TKT ticket_digest: digest0:", digest);
+    sep2 = strchr(sep+1, SEPARATOR);
+    if (NULL != sep2) {
+        buffer_copy_string_len(parsed->tokens, sep+1, sep2-sep-1);
+        sep = sep2;
     }
 
-    /* Generate the second digest */
-    MD5_Init(&Md5Ctx);
-    MD5_Update(&Md5Ctx, (unsigned char *)digest, MD5_DIGEST_SZ);
-    MD5_Update(&Md5Ctx, (unsigned char *)secret->ptr, secret->used - 1);
-    MD5_Final(Hash, &Md5Ctx);
-    CvtHex(Hash, digest);
-
-    if (cfg->auth_debug) {
-	log_error_write(srv, __FILE__, __LINE__, "ss", 
-		"TKT ticket_digest: digest:", digest);
-    }
-
-    buffer_free(remote_ip);
+    /* Copy user data to parsed->user_data */
+    ++sep;
+    buffer_copy_string_len(parsed->user_data, sep,
+                           tkt + buffer_string_length(parsed->tmp_buf) - sep);
 
     return 1;
 }/*}}}*/
 
-/* Check for required user
- * Returns 1 on success, 0 on failure */
-static int match_users(server *srv, mod_auth_tkt_plugin_config *cfg, array *requsers, buffer *user)/*{{{*/
-{
-    int i;
-    buffer *cur;
 
-    if (requsers->used == 0) {
-	/* valid-user */
-	return 1;
-    }
-    for (i = 0; i < requsers->used; i++) {
-	cur = ((data_string *)requsers->data[i])->value;
-	if (buffer_is_equal(cur, user)) return 1;
+/* Search query string for our ticket */
+static int authn_tkt_from_querystring(connection *con, mod_authn_tkt_plugin_data *p)/*{{{*/
+{
+    const buffer * const name = p->conf.auth_opts->auth_cookie_name;
+    const size_t nlen = buffer_string_length(name);
+    const char *qstr = con->uri.query->ptr;
+    if (buffer_string_is_empty(con->uri.query)) return 0;
+    for (const char *start=qstr, *amp, *end; *start; start = amp+1) {
+        amp = strchr(start+1, '&');
+        if (0 != strncmp(start, name->ptr, nlen) || start[nlen] != '=') {
+            if (NULL == amp) break;
+            continue;
+        }
+
+        /* query param includes our name - copy (first) value into result */
+        start += nlen + 1;
+        end = (NULL != amp)
+          ? amp - 1  /* end points at '&' we will not copy it! */
+          : qstr + buffer_string_length(con->uri.query);
+
+        /* For some reason (some clients?), tickets sometimes come in quoted */
+        if (*start == '"') {
+            ++start;
+            if (end[-1] == '"') --end;
+        }
+
+        /* Skip empty values (such as with misconfigured logoffs) */
+        if (end == start) {
+            if (NULL == amp) break;
+            continue;
+        }
+        else {
+            buffer *result = p->auth_rec.tmp_buf;
+            buffer_copy_string_len(result, start, end-start);
+            buffer_urldecode_path(result);
+            return parse_ticket(&p->auth_rec);
+        }
     }
     return 0;
 }/*}}}*/
 
-/* Check for required auth tokens 
- * Returns 1 on success, 0 on failure */
-static int match_tokens(server *srv, mod_auth_tkt_plugin_config *cfg, array *reqtokens, buffer *tokens)/*{{{*/
+/* Search cookie headers for our ticket */
+static int authn_tkt_from_cookie(connection *con, mod_authn_tkt_plugin_data *p)/*{{{*/
 {
-    char *tok = tokens->ptr, *delim = NULL;
-    int match = 0; 
-    int i, len;
+    const buffer * const name = p->conf.auth_opts->auth_cookie_name;
+    const size_t nlen = buffer_string_length(name);
+    const buffer * const hdr =
+      http_header_request_get(con, HTTP_HEADER_COOKIE, CONST_STR_LEN("Cookie"));
+    if (NULL == hdr) return 0;
+    for (const char *start=hdr->ptr, *semi, *end; *start; start = semi+1) {
+        semi = strchr(start+1, ';');
+        if (0 != strncmp(start, name->ptr, nlen) || start[nlen] != '=') {
+            if (NULL == semi) break;
+            continue;
+        }
 
-    /* Failure if required and no user tokens found */
-    if (tokens->used == 0) return 0;
+        /* Cookie includes our cookie name - copy (first) value into result */
+        start += nlen + 1;
+        end = (NULL != semi)
+          ? semi - 1  /* end points at ';' we will not copy it! */
+          : hdr->ptr + buffer_string_length(hdr);
 
-    do {
-	delim = strchr(tok, ',');
-	if (delim) {
-	    len = delim-tok;
-	} else {
-	    len = strlen(tok);
-	}
-	for (i = 0; i < reqtokens->used; i++) {
-	    buffer *reqtok = ((data_string *)reqtokens->data[i])->value;
-	    if (buffer_is_equal_string(reqtok, tok, len)) {
-		match = 1;
-		break;
-	    }
-	}
-	if (match) break;
-	if (delim) tok = delim+1;
-    } while (delim);
+        /* For some reason (some clients?), tickets sometimes come in quoted */
+        if (*start == '"') {
+            ++start;
+            if (end[-1] == '"') --end;
+        }
 
-    if (cfg->auth_debug && match == 0) {
-      log_error_write(srv, __FILE__, __LINE__, "sb", 
-	      "mod_auth_tkt: no matching tokens! User tokens:", tokens);
+        /* Skip empty cookies (such as with misconfigured logoffs) */
+        if (end == start) {
+            if (NULL == semi) break;
+            continue;
+        }
+        else {
+            buffer *result = p->auth_rec.tmp_buf;
+            buffer_clear(result);
+            buffer_append_base64_decode(result,start,end-start,BASE64_STANDARD);
+            return parse_ticket(&p->auth_rec);
+        }
     }
-
-    return match;
-}/*}}}*/
-
-/* Refresh the auth cookie if timeout refresh is set */
-static void refresh_cookie(server *srv, connection *con,
-	mod_auth_tkt_plugin_config *cfg, auth_tkt *parsed, 
-	const char *cookie_name, unsigned int timeout, int force_flag)/*{{{*/
-{
-    /* The timeout refresh is a double between 0 and 1, signifying what
-    * proportion of the timeout should be left before we refresh i.e. 
-    * 0 means never refresh (hard timeouts); 1 means always refresh;
-    * .33 means only refresh if less than a third of the timeout 
-    * period remains. */ 
-    unsigned int now = time(NULL);
-    int remainder = parsed->timestamp + timeout - now;
-    double refresh_sec = cfg->auth_timeout_refresh * timeout;
-
-    if (cfg->auth_debug >= 1) {
-	char buf[1024];
-	sprintf(buf, "mod_auth_tkt: timeout %u, refresh %f, remainder %d, refresh_sec, %f", 
-		timeout, cfg->auth_timeout_refresh, remainder, refresh_sec);
-	log_error_write(srv, __FILE__, __LINE__, "s", buf);
-    }
-
-    /* If less than our refresh_sec treshold, refresh the cookie */
-    if (force_flag || remainder < refresh_sec) {
-	char digest[MD5_DIGEST_SZ+1];
-	char sep = SEPARATOR;
-	buffer *ticket, *ticket_base64 = buffer_init();
-
-	ticket_digest(srv, con, cfg, parsed, now, digest);
-	ticket = buffer_init_string(digest);
-	sprintf(digest, "%08x", now);
-	buffer_append_string(ticket, digest);
-	buffer_append_string_buffer(ticket, parsed->uid);
-	buffer_append_string_len(ticket, &sep, 1);
-	if (parsed->tokens->used > 0) {
-	    buffer_append_string_buffer(ticket, parsed->tokens);
-	    buffer_append_string_len(ticket, &sep, 1);
-	}
-	buffer_append_string_buffer(ticket, parsed->user_data);
-
-	buffer_base64_encode(ticket, ticket_base64);
-	if (cfg->auth_debug) {
-	    log_error_write(srv, __FILE__, __LINE__, "sbsb",
-		    "mod_auth_tkt: refreshing cookie with", ticket, "encoded:", ticket_base64);
-	}
-
-	send_auth_cookie(srv, con, cfg, cookie_name, ticket_base64); 
-    }
-}/*}}}*/
-  
-/* Check whether the given timestamp has timed out 
- * Returns 1 if OK, 0 if timed out */
-static int check_timeout(server *srv, connection *con, 
-	mod_auth_tkt_plugin_config *cfg, auth_tkt *parsed,
-	char *cookie_name)/*{{{*/
-{
-    buffer *timeout_cookie;
-    time_t now = time(NULL);
-    buffer *domain = buffer_is_empty(cfg->auth_domain) ? con->server_name : cfg->auth_domain;
-    int timeout;
-    data_string *ds;
-    
-    /* Success if no timeout configured */
-    if (cfg->auth_timeout == 0) return 1;
-
-    timeout = cfg->auth_timeout == -1 ? DEFAULT_TIMEOUT_SEC : cfg->auth_timeout;
-
-    /* Check whether timestamp is still fresh */
-    if (parsed->timestamp + timeout >= now) {
-	if (cfg->auth_debug >= 1) {
-	    log_error_write(srv, __FILE__, __LINE__, "sdsdsd",
-		    "TKT: cookie timeout still good: now", now, 
-		    "timeout:", timeout, "tstamp:", parsed->timestamp);
-	}
-
-	/* Check whether to refresh the cookie */
-	if (cfg->auth_timeout_refresh > 0) 
-	  refresh_cookie(srv, con, cfg, parsed, cookie_name, timeout, CHECK_REFRESH);
-
-	return 1;
-    }
-
-    if (cfg->auth_debug >= 1) {
-	log_error_write(srv, __FILE__, __LINE__, "sdsdsd",
-		"TKT: ticket timed out: now", now, 
-		"timeout:", timeout, "timestamp:", parsed->timestamp);
-
-    }
-
-    /* Ticket is invalid. Erase it! */
-    if (NULL == (ds = (data_string *)array_get_unused_element(con->response.headers, TYPE_STRING))) {
-	    ds = data_response_init();
-    }
-    buffer_copy_string(ds->key, "Set-Cookie");
-    timeout_cookie = ds->value;
-    /* Delete cookie (set expired) if invalid, in case we want to set from url */
-    buffer_copy_string(timeout_cookie, cookie_name);
-    buffer_append_string(timeout_cookie, "=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT");
-    if (domain->used) {
-	buffer_append_string(timeout_cookie, "; domain=");
-	buffer_append_string_encoded(timeout_cookie, CONST_BUF_LEN(domain), ENCODING_REL_URI);
-    }
-    if (cfg->auth_cookie_secure > 0) {
-	buffer_append_string(timeout_cookie, "; secure");
-    }
-    array_insert_unique(con->response.headers, (data_unset *)ds);
-	
     return 0;
 }/*}}}*/
 
-/* Set environment variable for backend (SCGI, FastCGI, ...) */
-static void add_to_env(array *env, char *key, buffer *value)/*{{{*/
+#if 1
+/* Strip specified query args from a url and append the rest urlencoded */
+static void query_append_urlencoded(buffer *b, buffer *q, buffer *omit)/*{{{*/
 {
-    data_string *ds_dst;
-
-    if (NULL == (ds_dst = (data_string *)array_get_unused_element(env, TYPE_STRING))) {
-	ds_dst = data_string_init();
+    char sep[] = "?";
+    char *qend = q->ptr + buffer_string_length(q);
+    for (char *qb = q->ptr, *qe; qb < qend; qb = qe+1) {
+        qe = strchr(qb, '=');
+        if (NULL == qe || !buffer_is_equal_string(omit, qb, (size_t)(qe-qb))) {
+            if (NULL != qe) qe = strchr(qe+1, '&');
+            if (NULL == qe) qe = qend;
+            buffer_append_string_encoded(b, sep, 1, ENCODING_REL_URI_PART);
+            if (*sep == '?') *sep = '&';
+            buffer_append_string_encoded(b, qb, (size_t)(qe - qb),
+                                         ENCODING_REL_URI_PART);
+        }
     }
-
-    buffer_copy_string(ds_dst->key, key);
-    buffer_copy_string_buffer(ds_dst->value, value);
-    array_insert_unique(env, (data_unset *)ds_dst);
 }/*}}}*/
-
-/* Main ticket authentication entry point */
-URIHANDLER_FUNC(mod_auth_tkt_uri_handler) /*{{{*/
-{
-	size_t k;
-	int auth_required = 0, auth_satisfied = 0;
-	buffer *cookie = buffer_init();
-	data_string *ds;
-	mod_auth_tkt_plugin_data *p = p_d;
-	char *cookie_name; 	
-	int cookie_name_len;
-	array *req;
-	int (*fcmp) (char *, char *, int);
-	auth_tkt auth_rec;
-	int r;
-	buffer *redirect_url;
-	
-	if (buffer_is_empty(con->uri.path)) return HANDLER_GO_ON;
-
-	/* select the right config */
-	mod_auth_tkt_patch_connection(srv, con, p);
-
-	if (p->conf.auth_require == NULL) return HANDLER_GO_ON;
-	
-	/*
-	 * AUTH
-	 *  
-	 */
-	
-	/* do we have to ask for auth ? */
-	
-	auth_required = 0;
-	auth_satisfied = 0;
-	
-
-	/* if we have a case-insensitive FS we have to lower-case the URI here too */
-	if (con->conf.force_lowercase_filenames) {
-	    fcmp = strncasecmp;
-	} else {
-	    fcmp = strncmp;
-	}
-	/* search auth-directives for path */
-	for (k = 0; k < p->conf.auth_require->used; k++) {
-		buffer *req = p->conf.auth_require->data[k]->key;
-
-		if (req->used == 0) continue;
-		if (con->uri.path->used < req->used) continue;
-
-		if (0 == fcmp(con->uri.path->ptr, req->ptr, req->used - 1)) {
-			auth_required = 1;
-			break;
-		}
-	}
-	
-	/* we have nothing to do */
-	if (auth_required == 0) return HANDLER_GO_ON;
-
-	/* set default redirect URL */
-	redirect_url = p->conf.auth_login_url;
-
-	/* check config */
-	/* Module is misconfigured unless secret is set */
-	if (buffer_is_empty(p->conf.auth_secret)) {
-		log_error_write(srv, __FILE__, __LINE__, "s", 
-				"mod_auth_tkt: need secret");
-		con->http_status = 500;
-
-		return HANDLER_FINISHED;
-	}
-
-	/* Module is not configured unless login_url or guest_login is set */
-	if (buffer_is_empty(p->conf.auth_login_url) && (p->conf.auth_guest_login == 0)) {
-		log_error_write(srv, __FILE__, __LINE__, "s", 
-				"mod_auth_tkt: need either auth_tkt.login_url of auth_tkt.guest_login to be enabled");
-		con->http_status = 403;
-
-		return HANDLER_FINISHED;
-	}
-
-	/* redirect/login if scheme not "https" and require_ssl is set */
-	if (p->conf.auth_require_ssl && con->conf.is_ssl == 0) {
-		log_error_write(srv, __FILE__, __LINE__, "s", 
-				"mod_auth_tkt: redirect/login - unsecured request, auth_tkt.require_ssl is enabled");
-
-		redirect(srv, con, &(p->conf), redirect_url);
-		
-		return HANDLER_FINISHED;
-	}
-
-	/* Backwards compatibility mode for auth_tkt.require_ssl */
-	if (p->conf.auth_require_ssl && (p->conf.auth_cookie_secure == -1)) {
-		/* Set secure_cookie flag if require_ssl is set and secure_cookie is 
-		   undefined (as opposed to 'off') */
-		log_error_write(srv, __FILE__, __LINE__, "ss", 
-				"mod_auth_tkt: auth_tkt.require_ssl on, but no auth_tkt.cookie_secure found - ",
-				"please set auth_tkt.cookie_secure explicitly, assuming 'enabled'");
-		p->conf.auth_cookie_secure = 1;
-	}
-
-	/* set default cookie_name if needed */
-	if (buffer_is_empty(p->conf.auth_cookie_name)) {
-		cookie_name = AUTH_COOKIE_NAME;
-		cookie_name_len = sizeof(AUTH_COOKIE_NAME);
-	} else {
-		cookie_name = p->conf.auth_cookie_name->ptr;
-		cookie_name_len = p->conf.auth_cookie_name->used-1;
-	}
-
-	/* parameters extracted from the ticket */
-	init_auth_rec(&auth_rec);
-
-	/* authentification parameters for this url ("require" & "tickets") */
-	req = ((data_array *)(p->conf.auth_require->data[k]))->value;
-	
-#if 0
-	/* TODO */
-	/* Check for url ticket - either found (accept) or empty (reset/login) */
-	ticket = get_url_ticket(srv, con->uri.query);
 #endif
 
-	/* try to get Cookie-header */
-	ds = (data_string *)array_get_element(con->request.headers, "Cookie");
-	
-	if (ds && ds->value && ds->value->used) {
-	    if (p->conf.auth_debug) {
-		log_error_write(srv, __FILE__, __LINE__, "ssb", "auth", cookie_name, ds->value);
-	    }
+static int authn_tkt_construct_back_urlencoded(server *srv, connection *con, buffer *back, buffer *strip_arg)/*{{{*/
+{
+    buffer_copy_buffer(back, con->uri.scheme);
+    buffer_append_string_len(back, CONST_STR_LEN("://"));
+    buffer_clear(srv->tmp_buf);
+    if (0 != http_response_buffer_append_authority(srv, con, srv->tmp_buf))
+        return 0;
+    buffer_append_string_encoded(back, CONST_BUF_LEN(srv->tmp_buf),
+                                 ENCODING_REL_URI_PART);
+    buffer_append_string_encoded(back, CONST_BUF_LEN(con->uri.path),
+                                 ENCODING_REL_URI_PART);
+    if (!buffer_string_is_empty(con->uri.query)) {
+      #if 1
+        /* XXX: why strip auth_cookie_name instead of back_arg_name? */
+        /* Strip any auth_cookie_name arguments from the current args */
+        query_append_urlencoded(back, con->uri.query, strip_arg);
+      #else
+        buffer_append_string_len(back, "?", 1);
+        buffer_append_string_encoded(back, CONST_BUF_LEN(con->uri.query),
+                                     ENCODING_REL_URI_PART);
+      #endif
+    }
+    return 1;
+}/*}}}*/
 
-	    /* cookie is assigned in cookie_match */
-	    if (cookie_match(srv, &(p->conf), ds->value, cookie_name, cookie_name_len, cookie) 
-		    && (cookie->used >= MD5andTSTAMP)) {
-		char digest[MD5_DIGEST_SZ+1];
-		data_array *require, *tokens;
+/* External redirect to the given url, setting back cookie or arg */
+static handler_t authn_tkt_redirect(server *srv, connection *con, mod_authn_tkt_plugin_opts *opts, buffer *location, buffer *back)/*{{{*/
+{
+    /* set default redirect URL */
+    if (buffer_string_is_empty(location))
+        location = opts->auth_login_url;
 
-		if (!parse_ticket(srv, &(p->conf), cookie, &auth_rec)) {
-		    if (p->conf.auth_debug) {
-			  log_error_write(srv, __FILE__, __LINE__, "sb",
-			    "auth_tkt: unparseable ticket found", cookie);
-		    }
-		} else {
-		    /* ticket syntax OK */
-		    if (p->conf.auth_debug) {
-			    log_error_write(srv, __FILE__, __LINE__, "sbsbsbsd",
-			      "auth_tkt: ticket uid", auth_rec.uid,  
-			      "tokens", auth_rec.tokens, 
-			      "user_data", auth_rec.user_data, 
-			      "timestamp", auth_rec.timestamp);
-		    }
-		    /* Check ticket hash */
-		    ticket_digest(srv, con, &(p->conf), &auth_rec, 0, digest);
-		    if (memcmp(cookie->ptr, digest, MD5_DIGEST_SZ) != 0) {
-			log_error_write(srv, __FILE__, __LINE__, "sssb",
-			       "mod_auth_tkt: ticket found, but hash is invalid - digest",  
-			       digest, "ticket", cookie);
-		    } else {
-			/* ticket valid */
-			log_error_write(srv, __FILE__, __LINE__, "ss",
-			       "mod_auth_tkt: ticket matched",  digest);
+    if (buffer_string_is_empty(location)) {
+        /* Module is not configured unless login_url is set (or guest_login is enabled) */
+        log_error_write(srv, __FILE__, __LINE__, "s",
+                        "authn_tkt login-url not configured");
+        con->http_status = 403;
+        return HANDLER_FINISHED;
+    }
 
-			/* check user */
-			require = (data_array *)array_get_element(req, "require");
-			/* 'require' is a compulsory configuration parameter,
-			 * don't check for its existence */
-			if (!match_users(srv, &(p->conf), require->value, auth_rec.uid)) {
-			    log_error_write(srv, __FILE__, __LINE__, "sb",
-				   "mod_auth_tkt: user NOT matched", auth_rec.uid);
-			    redirect_url = buffer_is_empty(p->conf.auth_unauth_url) 
-					       ? p->conf.auth_login_url 
-					       : p->conf.auth_unauth_url;
-			    goto process;
-			}
-			if (p->conf.auth_debug) {
-			    log_error_write(srv, __FILE__, __LINE__, "sb",
-				   "mod_auth_tkt: user matched", auth_rec.uid);
-			}
+    if (!authn_tkt_construct_back_urlencoded(srv, con, back,
+                                             opts->auth_cookie_name)) {
+        con->http_status = 500;
+        return HANDLER_FINISHED;
+    }
 
-			/* check for tokens */
-			tokens = (data_array *)array_get_element(req, "tokens");
-			if (tokens != NULL && tokens->value->used > 0) {
-			    if (!match_tokens(srv, &(p->conf), tokens->value, auth_rec.tokens)) {
-				log_error_write(srv, __FILE__, __LINE__, "sb",
-				       "mod_auth_tkt: tokens NOT matched", auth_rec.tokens);
-				redirect_url = buffer_is_empty(p->conf.auth_unauth_url) 
-						   ? p->conf.auth_login_url 
-						   : p->conf.auth_unauth_url;
-				goto process;
-			    } else {
-				if (p->conf.auth_debug) {
-				    log_error_write(srv, __FILE__, __LINE__, "sb",
-					   "mod_auth_tkt: tokens matched", auth_rec.tokens);
-				}
-			    }
-			}
-			/* check timeout */
-			if (!check_timeout(srv, con, &(p->conf), &auth_rec, cookie_name)) {
-			    if (con->request.http_method == HTTP_METHOD_POST 
-				    && p->conf.auth_post_timeout_url->used > 0) {
-				redirect_url = p->conf.auth_post_timeout_url;
-			    } else {
-				redirect_url = buffer_is_empty(p->conf.auth_timeout_url) 
-						   ? p->conf.auth_login_url 
-						   : p->conf.auth_timeout_url;
-			    }
-			} else {
-			    auth_satisfied = 1;
-			}
-		    }
-		}
-	    }
-	}
-process:	
-	if (!auth_satisfied) {
-	    if (redirect_url && (redirect_url->used > 0)) {
-		redirect(srv, con, &(p->conf), redirect_url);
-	    } else {
-		if (p->conf.auth_debug >= 2) {
-		    log_error_write(srv, __FILE__, __LINE__, "s", 
-				    "mod_auth_tkt: empty redirect URL");
-		}
-		con->http_status = 403;
-	    }
+    if (!buffer_string_is_empty(opts->auth_back_cookie_name)) {
+        /* XXX: should this get an expires param, if configured?
+         * (prior code omitted expires for auth_back_cookie_name) */
+        send_auth_cookie(con,opts,opts->auth_back_cookie_name,back,srv->cur_ts);
+        http_header_response_set(con, HTTP_HEADER_LOCATION,
+                                 CONST_STR_LEN("Location"),
+                                 CONST_BUF_LEN(location));
+    }
+    else if (!buffer_string_is_empty(opts->auth_back_arg_name)) {
+        /* If auth_back_cookie_name not set, add back arg to querystr */
+        buffer *url = srv->tmp_buf;
+        buffer_copy_buffer(url, location);
+        buffer_append_string_len(url, strchr(location->ptr,'?') ? "&" : "?", 1);
+        buffer_append_string_buffer(url, opts->auth_back_arg_name);
+        buffer_append_string_len(url, "=", 1);
+        buffer_append_string_buffer(url, back);
+        http_header_response_set(con, HTTP_HEADER_LOCATION,
+                                 CONST_STR_LEN("Location"),
+                                 CONST_BUF_LEN(url));
+    }
+    else {
+      #if 1
+        http_header_response_set(con, HTTP_HEADER_LOCATION,
+                                 CONST_STR_LEN("Location"),
+                                 CONST_BUF_LEN(location));
+      #else
+        /* XXX: should back_cookie_name and back_arg_name be the same? */
+        log_error_write(srv, __FILE__, __LINE__, "s",
+                "need either auth _tkt back-cookie-name or auth _tkt back-arg-name to be set");
+        con->http_status = 403;
+        con->file_finished = 1;
+        return HANDLER_FINISHED;
+      #endif
+    }
 
-	    r = HANDLER_FINISHED;
-	} else {
-	    buffer *auth_type = buffer_init_string("Basic");
+    con->http_status = 302;
+    con->file_finished = 1;
+    return HANDLER_FINISHED;
+}/*}}}*/
 
-	    /* set CGI/FCGI/SCGI environment */
-	    if (p->conf.auth_debug) {
-		log_error_write(srv, __FILE__, __LINE__, "sb", 
-			"user:", auth_rec.uid);
-	    }
-	    buffer_copy_string_buffer(con->authed_user, auth_rec.uid);
+/* Generate a ticket digest string from the given details */
+static void ticket_digest_MD5(authn_tkt *parsed, time_t timestamp, const buffer *secret)/*{{{*/
+{
+    uint32_t ts = htonl((uint32_t)timestamp); /*(assumes 32-bit time_t)*/
+    li_MD5_CTX ctx;
 
-	    add_to_env(con->environment, "REMOTE_USER_DATA", auth_rec.user_data);
-	    add_to_env(con->environment, "REMOTE_USER_TOKENS", auth_rec.tokens);
-	    add_to_env(con->environment, "AUTH_TYPE", auth_type);
-	    buffer_free(auth_type);
+    /* Generate the initial digest */
+    li_MD5_Init(&ctx);
+    if (NULL != parsed->addr_buf) {
+        li_MD5_Update(&ctx,(unsigned char *)CONST_BUF_LEN(parsed->addr_buf));
+    }
+    li_MD5_Update(&ctx, (unsigned char *)&ts, sizeof(ts));
+    li_MD5_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
+    li_MD5_Update(&ctx, (unsigned char *)CONST_BUF_LEN(parsed->uid));
+    if (!buffer_string_is_empty(parsed->tokens)) {
+        li_MD5_Update(&ctx, (unsigned char *)CONST_BUF_LEN(parsed->tokens));
+    }
+    if (!buffer_string_is_empty(parsed->user_data)) {
+        li_MD5_Update(&ctx,(unsigned char*)CONST_BUF_LEN(parsed->user_data));
+    }
+    li_MD5_Final(parsed->digest, &ctx);
 
-	    r = HANDLER_GO_ON;
-	}
-	free_auth_rec(&auth_rec);
-	return r;
+    /* Generate the second digest */
+    li_MD5_Init(&ctx);
+    li_MD5_Update(&ctx, parsed->digest, parsed->digest_len);
+    li_MD5_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
+    li_MD5_Final(parsed->digest, &ctx);
+}/*}}}*/
+
+#ifdef USE_OPENSSL_CRYPTO
+static void ticket_digest_SHA256(authn_tkt *parsed, time_t timestamp, const buffer *secret)/*{{{*/
+{
+    uint32_t ts = htonl((uint32_t)timestamp); /*(assumes 32-bit time_t)*/
+    SHA256_CTX ctx;
+
+    /* Generate the initial digest */
+    SHA256_Init(&ctx);
+    if (NULL != parsed->addr_buf) {
+        SHA256_Update(&ctx,(unsigned char *)CONST_BUF_LEN(parsed->addr_buf));
+    }
+    SHA256_Update(&ctx, (unsigned char *)&ts, sizeof(ts));
+    SHA256_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
+    SHA256_Update(&ctx, (unsigned char *)CONST_BUF_LEN(parsed->uid));
+    if (!buffer_string_is_empty(parsed->tokens)) {
+        SHA256_Update(&ctx, (unsigned char *)CONST_BUF_LEN(parsed->tokens));
+    }
+    if (!buffer_string_is_empty(parsed->user_data)) {
+        SHA256_Update(&ctx,(unsigned char*)CONST_BUF_LEN(parsed->user_data));
+    }
+    SHA256_Final(parsed->digest, &ctx);
+
+    /* Generate the second digest */
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, parsed->digest, parsed->digest_len);
+    SHA256_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
+    SHA256_Final(parsed->digest, &ctx);
+}/*}}}*/
+
+static void ticket_digest_SHA512(authn_tkt *parsed, time_t timestamp, const buffer *secret)/*{{{*/
+{
+    uint32_t ts = htonl((uint32_t)timestamp); /*(assumes 32-bit time_t)*/
+    SHA512_CTX ctx;
+
+    /* Generate the initial digest */
+    SHA512_Init(&ctx);
+    if (NULL != parsed->addr_buf) {
+        SHA512_Update(&ctx,(unsigned char *)CONST_BUF_LEN(parsed->addr_buf));
+    }
+    SHA512_Update(&ctx, (unsigned char *)&ts, sizeof(ts));
+    SHA512_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
+    SHA512_Update(&ctx, (unsigned char *)CONST_BUF_LEN(parsed->uid));
+    if (!buffer_string_is_empty(parsed->tokens)) {
+        SHA512_Update(&ctx, (unsigned char *)CONST_BUF_LEN(parsed->tokens));
+    }
+    if (!buffer_string_is_empty(parsed->user_data)) {
+        SHA512_Update(&ctx,(unsigned char*)CONST_BUF_LEN(parsed->user_data));
+    }
+    SHA512_Final(parsed->digest, &ctx);
+
+    /* Generate the second digest */
+    SHA512_Init(&ctx);
+    SHA512_Update(&ctx, parsed->digest, parsed->digest_len);
+    SHA512_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
+    SHA512_Final(parsed->digest, &ctx);
+}/*}}}*/
+
+#endif
+
+/* Refresh the auth cookie if timeout refresh is set */
+static void refresh_cookie(server *srv, connection *con, mod_authn_tkt_plugin_opts *opts, authn_tkt *parsed)/*{{{*/
+{
+    time_t now = srv->cur_ts;
+    uint32_t ts = htonl((uint32_t)now); /*(assumes 32-bit time_t)*/
+    char sep[2] = { SEPARATOR, '\0' };
+    buffer *ticket = srv->tmp_buf, *ticket_base64 = parsed->tmp_buf;
+    void(*ticket_digest)(authn_tkt *,time_t,const buffer *) = parsed->digest_fn;
+
+    ticket_digest(parsed, now, opts->auth_secret);
+    buffer_clear(ticket);
+    buffer_append_string_encoded_hex_lc(ticket, (char *)parsed->digest,
+                                        parsed->digest_len);
+  #if 1 /*(ensure full 8 hex chars emitted for 32-bit entity)*/
+    buffer_append_string_encoded_hex_lc(ticket, (char *)&ts, sizeof(ts));
+  #else
+    buffer_append_uint_hex_lc(ticket, (uintmax_t)now);
+  #endif
+    buffer_append_string_buffer(ticket, parsed->uid);
+    if (!buffer_string_is_empty(parsed->tokens)) {
+        buffer_append_string_len(ticket, sep, 1);
+        buffer_append_string_buffer(ticket, parsed->tokens);
+    }
+    buffer_append_string_len(ticket, sep, 1);
+    buffer_append_string_buffer(ticket, parsed->user_data);
+
+    buffer_clear(ticket_base64);
+    buffer_append_base64_encode(ticket_base64,
+                                (unsigned char *)CONST_BUF_LEN(ticket),
+                                BASE64_STANDARD);
+
+    send_auth_cookie(con,opts,opts->auth_cookie_name,ticket_base64,now);
+}/*}}}*/
+
+/* Check whether or not the digest is valid
+ * Returns 0 if invalid , 1 if valid, 2 if valid-with-old-secret
+ *   (valid-with-old-secret requires a cookie refresh to use current secret)
+ */
+static int check_digest(mod_authn_tkt_plugin_opts *opts, authn_tkt * const auth_rec)/*{{{*/
+{
+    void(*ticket_digest)(authn_tkt *, time_t, const buffer *)
+      = auth_rec->digest_fn;
+    const size_t len = auth_rec->digest_len;
+    unsigned char digest[MAX_DIGEST_LENGTH];
+    memcpy(digest, auth_rec->digest, len);
+
+    ticket_digest(auth_rec, auth_rec->timestamp, opts->auth_secret);
+
+    if (http_auth_const_time_memeq((char *)digest, len,
+                                   (char *)auth_rec->digest, len)) {
+        return 1;
+    }
+
+  #if 0 /*(debug)*/
+    buffer_clear(auth_rec->tmp_buf);
+    buffer_append_string_encoded_hex_lc(auth_rec->tmp_buf,
+                                        (char *)auth_rec->digest,
+                                        auth_rec->digest_len);
+    buffer_clear(srv->tmp_buf);
+    buffer_append_string_encoded_hex_lc(srv->tmp_buf,
+                                        (char *)digest,
+                                        auth_rec->digest_len);
+    log_error_write(srv, __FILE__, __LINE__, "sbsb", "digest NOT matched",
+                    auth_rec->tmp_buf, "ticket", srv->tmp_buf);
+  #endif
+
+    if (!buffer_string_is_empty(opts->auth_secret_old)) {
+        ticket_digest(auth_rec, auth_rec->timestamp, opts->auth_secret_old);
+        if (http_auth_const_time_memeq((char *)digest, len,
+                                       (char *)auth_rec->digest, len)) {
+            auth_rec->refresh_cookie = 1;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* Check whether or not the given timestamp has timed out
+ * Returns 0 if timed out, 1 if OK, 2 if OK and trigger cookie refresh */
+static int check_timeout(mod_authn_tkt_plugin_opts *opts, authn_tkt *parsed, time_t now)/*{{{*/
+{
+    time_t expire = (TIME_T_MAX - parsed->timestamp > opts->auth_timeout)
+      ? parsed->timestamp + opts->auth_timeout
+      : TIME_T_MAX;
+
+    /* Check if ticket expired */
+    if (expire < now) return 0;
+
+    /* Check whether remaining ticket lifetime is below refresh threshold */
+    if (expire - now < opts->auth_timeout_refresh) parsed->refresh_cookie = 1;
+
+    return 1;
+}/*}}}*/
+
+/* Check for required auth tokens
+ * Returns 1 on success, 0 on failure */
+static int match_tokens(array *reqtokens, buffer *tokens)/*{{{*/
+{
+    const char * const end = tokens->ptr+buffer_string_length(tokens);
+    for (const char *delim, *tok = tokens->ptr; tok < end; tok = delim+1) {
+        const size_t len =
+          (size_t)(((delim = strchr(tok,',')) ? delim : (delim=end)) - tok);
+        for (size_t i = 0; i < reqtokens->used; ++i) {
+            buffer *reqtok = ((data_string *)reqtokens->data[i])->value;
+            if (buffer_is_equal_string(reqtok, tok, len)) return 1; /* match */
+        }
+    }
+    return 0; /* Failure if required and no user tokens found */
+}/*}}}*/
+
+static int check_tokens(connection *con, mod_authn_tkt_plugin_opts *opts, authn_tkt *auth_rec)/*{{{*/
+{
+    data_array *da;
+
+    /* no path prefixes with required tokens */
+    if (0 == opts->auth_tokens->used) return 1;
+
+    /* search tokens directive for first prefix match against URL path */
+    /* (if we have case-insensitive FS, then match case-insensitively here) */
+    da = (data_array *)((!con->conf.force_lowercase_filenames)
+       ? array_match_key_prefix(opts->auth_tokens, con->uri.path)
+       : array_match_key_prefix_nc(opts->auth_tokens, con->uri.path));
+    if (NULL == da) return 1; /* no matching path prefix with required tokens */
+    if (0 == da->value->used) return 1; /* no tokens required */
+
+    return match_tokens(da->value, auth_rec->tokens);
+}/*}}}*/
+
+static void init_guest_auth_rec(mod_authn_tkt_plugin_opts *opts, authn_tkt *auth_rec)/*{{{*/
+{
+    if (opts->auth_guest_cookie) auth_rec->refresh_cookie = 1;
+    buffer_clear(auth_rec->user_data);
+    buffer_clear(auth_rec->tokens);
+    if (buffer_string_is_empty(opts->auth_guest_user)) {
+        buffer_copy_string_len(auth_rec->uid,CONST_STR_LEN(DEFAULT_GUEST_USER));
+    }
+    else {
+        /*(future: might parse at startup and store str parts, flags in opts)*/
+        buffer *u = opts->auth_guest_user;
+        char *b = u->ptr, *e;
+        buffer_clear(auth_rec->uid);
+        while (NULL != (e = strchr(b, '%'))) {
+            size_t n = 0;
+            buffer_append_string_len(auth_rec->uid, b, (size_t)(e - b));
+            b = e;
+            while (light_isdigit(*(++e))) { n *= 10; n += (*e - '0'); }
+            if (*e == 'U') {
+                /* Note: this is not cryptographically strong */
+                unsigned char x[16];
+                li_rand_pseudo_bytes((unsigned char *)x, sizeof(x));
+                if (n & 1) ++n;
+                n <<= 1;
+                if (0 == n || sizeof(x) < n) n = sizeof(x);
+                buffer_append_string_encoded_hex_lc(auth_rec->uid,(char *)x,n);
+                b = e+1;
+                break;
+            }
+            else {
+                buffer_append_string_len(auth_rec->uid, CONST_STR_LEN("%"));
+                ++b;
+                continue;
+            }
+        }
+        e = u->ptr + buffer_string_length(u);
+        if (e - b) buffer_append_string_len(auth_rec->uid, b, (size_t)(e - b));
+    }
+}/*}}}*/
+
+/* ticket authentication entry point */
+static handler_t mod_authn_tkt_check(server *srv, connection *con, void *p_d, const struct http_auth_require_t *require, const struct http_auth_backend_t *backend) /*{{{*/
+{
+    mod_authn_tkt_plugin_opts *opts;
+    mod_authn_tkt_plugin_data *p = p_d;
+    authn_tkt * const auth_rec = &p->auth_rec;
+    int init_guest = 0;
+
+    mod_authn_tkt_patch_connection(srv, con, p);
+    opts = p->conf.auth_opts;
+    UNUSED(backend);
+
+    if (opts->auth_require_ssl) {
+        /* redirect/login if scheme not "https" and require-ssl is set */
+        /* (This option is part of authn_tkt to help users avoid mistakes in
+         *  module ordering which might result in cookie auth being performed
+         *  prior to redirect to https) */
+        if (!buffer_is_equal_caseless_string(con->uri.scheme,
+                                             CONST_STR_LEN("https"))) {
+          #if 0 /* noisy; use access logs to flag insecure requests */
+            log_error_write(srv, __FILE__, __LINE__, "s",
+                "redirect/login - unsecured request, "
+                "authn_tkt require-ssl is enabled");
+          #endif
+            /* XXX: should this redirect to same URL but https,
+             * instead of to auth_login_url? */
+            return authn_tkt_redirect(srv, con, opts, NULL, auth_rec->tmp_buf);
+        }
+    }
+
+    auth_rec->addr_buf = opts->auth_ignore_ip ? NULL : con->dst_addr_buf;
+    auth_rec->refresh_cookie = 0;
+    auth_rec->digest_fn = opts->auth_digest_fn;
+    auth_rec->digest_len = opts->auth_digest_len;
+    buffer_clear(auth_rec->user_data);
+    buffer_clear(auth_rec->tokens);
+
+    /* check query string and cookie headers for ticket
+     *   - either found (accept) or empty (reset/login) */
+    if (authn_tkt_from_querystring(con, p) || authn_tkt_from_cookie(con, p)) {
+        /* module is misconfigured unless secret is set */
+        if (buffer_string_is_empty(opts->auth_secret)) {
+            log_error_write(srv, __FILE__, __LINE__, "s", "need secret");
+            con->http_status = 500;
+            return HANDLER_FINISHED;
+        }
+
+        if (!check_digest(opts, auth_rec)
+            && !(init_guest = opts->auth_guest_login)) {
+            return authn_tkt_redirect(srv, con, opts, NULL, auth_rec->tmp_buf);
+        }
+
+        /* check timeout */
+        if (0 != opts->auth_timeout && !init_guest
+            && !check_timeout(opts, auth_rec, srv->cur_ts)) {
+            if (!(init_guest = opts->auth_guest_fallback)) {
+                buffer *redirect_url = opts->auth_timeout_url;
+                if (con->request.http_method == HTTP_METHOD_POST
+                    && !buffer_string_is_empty(opts->auth_post_timeout_url)) {
+                    redirect_url = opts->auth_post_timeout_url;
+                }
+                /* Delete cookie (set expired) in case we want to set from url*/
+                send_auth_cookie(con, opts, opts->auth_cookie_name, NULL, 0);
+                return authn_tkt_redirect(srv, con, opts, redirect_url,
+                                          auth_rec->tmp_buf);
+            }
+        }
+    }
+    else if (!(init_guest = opts->auth_guest_login)) {
+        return authn_tkt_redirect(srv, con, opts, NULL, auth_rec->tmp_buf);
+    }
+
+    /* initialize auth_rec as guest (if flagged) */
+    if (init_guest) init_guest_auth_rec(opts, auth_rec);
+
+    /* check authorization for auth_rec user (required) */
+    if (!http_auth_match_rules(require, auth_rec->uid->ptr, NULL, NULL)) {
+        log_error_write(srv, __FILE__, __LINE__, "sb",
+                        "user NOT matched", auth_rec->uid);
+        return authn_tkt_redirect(srv, con, opts, opts->auth_unauth_url,
+                                  auth_rec->tmp_buf);
+    }
+
+    /* check authorization for auth_rec tokens (optional) */
+    if (!check_tokens(con, opts, auth_rec)) {
+        log_error_write(srv, __FILE__, __LINE__, "sb",
+                        "tokens NOT matched", auth_rec->tokens);
+        return authn_tkt_redirect(srv, con, opts, opts->auth_unauth_url,
+                                  auth_rec->tmp_buf);
+    }
+
+    /* refresh cookie (if flagged) */
+    if (auth_rec->refresh_cookie) refresh_cookie(srv, con, opts, auth_rec);
+
+    /* set CGI/FCGI/SCGI environment */ /* XXX: ? set AUTH_TYPE="authn_tkt" ? */
+    http_auth_setenv(con, CONST_BUF_LEN(auth_rec->uid), CONST_STR_LEN("Basic"));
+    http_header_env_set(con, CONST_STR_LEN("REMOTE_USER_DATA"),
+                             CONST_BUF_LEN(auth_rec->user_data));
+    http_header_env_set(con, CONST_STR_LEN("REMOTE_USER_TOKENS"),
+                             CONST_BUF_LEN(auth_rec->tokens));
+    return HANDLER_GO_ON;  /* access granted */
 }/*}}}*/
 
 /* configuration processing & checking */
 static char *convert_to_seconds(buffer *cfg, int *timeout)/*{{{*/
 {
-	int num, multiplier;
-	char unit;
+    char *endptr;
+    unsigned long int n, m;
 
-	if (light_isdigit(cfg->ptr[0])) {
-		num = atoi(cfg->ptr);
-	} else {
-		return "bad time string - numeric expected";
-	}
+    if (buffer_string_is_empty(cfg)) {
+        return "bad time string - must not be empty";
+    }
 
-	if (*timeout < 0) *timeout = 0;
-	multiplier = 1;
+    n = strtoul(cfg->ptr, &endptr, 10);
 
-	unit = cfg->ptr[cfg->used - 2];
-	if (light_isalpha(unit)) {
-		if (unit == 's')
-			multiplier = 1;
-		else if (unit == 'm')
-			multiplier = 60;
-		else if (unit == 'h')
-			multiplier = 60 * 60;
-		else if (unit == 'd')
-			multiplier = 24 * 60 * 60;
-		else if (unit == 'w')
-			multiplier = 7 * 24 * 60 * 60;
-		else if (unit == 'M')
-			multiplier = 30 * 24 * 60 * 60;
-		else if (unit == 'y')
-			multiplier = 365 * 24 * 60 * 60;
-		else {
-			return "bad time string - unrecognized unit";
-		}
-	}
+    if (!light_isdigit(cfg->ptr[0]) || n > 65535 || cfg->ptr == endptr) {
+        return "bad time string - expecting non-negative number <= 65535";
+    }
 
-	*timeout += num * multiplier;
+    switch (*endptr) {
+      case '\0':
+      case 's': m = 1; break;
+      case 'm': m = 60; break;
+      case 'h': m = 60 * 60; break;
+      case 'd': m = 60 * 60 * 24; break;
+      case 'w': m = 60 * 60 * 24 * 7; break;
+      case 'M': m = 60 * 60 * 24 * 30; break;
+      case 'y': m = 60 * 60 * 24 * 365; break;
+      default: return "bad time string - unrecognized unit";
+    }
 
-	return NULL;
+    m *= n;
+    if (m < n || m > INT_MAX) {
+        return "integer overflow or invalid number";
+    }
+
+    *timeout = (int)m;
+    return NULL;
 }/*}}}*/
 
-static char *set_auth_tkt_timeout(buffer *cfg, int *timeout)/*{{{*/
+static mod_authn_tkt_plugin_opts * plugin_config_init_defaults(void) /*{{{*/
 {
-	char *msg;
+    mod_authn_tkt_plugin_opts *o = calloc(1, sizeof(mod_authn_tkt_plugin_opts));
+    force_assert(o);
 
-	if (light_isdigit(cfg->ptr[0]) && light_isdigit(cfg->ptr[cfg->used - 2])) {
-		/* Easy case - looks like all digits */
-		*timeout = atoi(cfg->ptr);
-	} else {
-		/* Harder case - convert units to seconds */
-		msg = convert_to_seconds(cfg, timeout);
-		if (msg) return msg;
-	}
+    o->auth_secret = buffer_init();
+    o->auth_secret_old = buffer_init();
+    o->auth_login_url = buffer_init();
+    o->auth_timeout_url = buffer_init();
+    o->auth_post_timeout_url = buffer_init();
+    o->auth_unauth_url = buffer_init();
+    o->auth_timeout_conf = buffer_init();
+    o->auth_timeout_refresh_conf = buffer_init();
+    o->auth_digest_type_conf = buffer_init();
+    o->auth_ignore_ip = 0;
+    o->auth_require_ssl = 0;
+    o->auth_cookie_secure = -1;
+    o->auth_cookie_name = buffer_init();
+    o->auth_cookie_domain = buffer_init();
+    o->auth_cookie_expires_conf = buffer_init();
+    o->auth_back_cookie_name = buffer_init();
+    o->auth_back_arg_name = buffer_init();
+    o->auth_guest_user = buffer_init();
+    o->auth_guest_login = 0;
+    o->auth_guest_cookie = 0;
+    o->auth_guest_fallback = 0;
+    o->auth_tokens = array_init();
 
-	if (*timeout < 0) {
-		return "timeout must be positive";
-	}
-	if (*timeout == INT_MAX) {
-		return "integer overflow or invalid number";
-	}
-	return NULL;
+    o->auth_timeout = DEFAULT_TIMEOUT_SEC;
+    o->auth_timeout_refresh = (int)(0.5 * DEFAULT_TIMEOUT_SEC);
+    o->auth_digest_fn = ticket_digest_MD5;
+    o->auth_digest_len = MD5_DIGEST_LENGTH;
+    o->auth_cookie_expires = 0;
+
+    return o;
 }/*}}}*/
 
-static char *set_auth_tkt_timeout_refresh(buffer *cfg, double *refresh)/*{{{*/
+static int parse_opts(server *srv, mod_authn_tkt_plugin_opts *opts, data_array *da) /*{{{*/
 {
-	*refresh = atof(cfg->ptr);
+    config_values_t cv[] = {
+      { "secret",            NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION }, /* 0 */   /* TKTAuthSecret */
+      { "secret-old",        NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthSecretOld */
+      { "login-url",         NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthLoginURL */
+      { "timeout-url",       NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthTimeoutURL */
+      { "post-timeout-url",  NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthPostTimeoutURL */
+      { "unauth-url",        NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthUnauthURL */
+      { "timeout",           NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthTimeout */
+      { "timeout-refresh",   NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthTimeoutRefresh */
+      { "digest-type",       NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthDigestType */
+      { "ignore-ip",         NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },          /* TKTAuthIgnoreIP */
+      { "require-ssl",       NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION }, /* 10 */ /* TKTAuthRequireSSL */
+      { "cookie-secure",     NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },          /* TKTAuthCookieSecure */
+      { "cookie-name",       NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthCookieName */
+      { "cookie-domain",     NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthDomain */
+      { "cookie-expires",    NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthCookieExpires */
+      { "back-cookie-name",  NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthBackCookieName */
+      { "back-arg-name",     NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthBackArgName */
+      { "guest-user",        NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },           /* TKTAuthGuestUser */
+      { "guest-login",       NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },          /* TKTAuthGuestLogin */
+      { "guest-cookie",      NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },          /* TKTAuthGuestCookie */
+      { "guest-fallback",    NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION }, /* 20 */ /* TKTAuthGuestFallback */
+      { "tokens",            NULL, T_CONFIG_ARRAY, T_CONFIG_SCOPE_CONNECTION },            /* TKTAuthToken */
+      { NULL,                NULL, T_CONFIG_UNSET, T_CONFIG_SCOPE_UNSET }
+    };
 
-	if (*refresh < 0.0 || *refresh > 1.0) {
-		return "refresh flag must be between 0 and 1";
-	}
-	return NULL;
+    if (NULL == da) return 1;
+
+    if (da->type != TYPE_ARRAY || !array_is_kvany(da->value)) {
+        log_error_write(srv, __FILE__, __LINE__, "s",
+          "unexpected value for auth.method.tkt.opts; expected "
+          "( \"key\" => \"value\" )");
+        return 0;
+    }
+
+    cv[0].destination = opts->auth_secret;
+    cv[1].destination = opts->auth_secret_old;
+    cv[2].destination = opts->auth_login_url;
+    cv[3].destination = opts->auth_timeout_url;
+    cv[4].destination = opts->auth_post_timeout_url;
+    cv[5].destination = opts->auth_unauth_url;
+    cv[6].destination = opts->auth_timeout_conf;
+    cv[7].destination = opts->auth_timeout_refresh_conf;
+    cv[8].destination = opts->auth_digest_type_conf;
+    cv[9].destination = &(opts->auth_ignore_ip);
+    cv[10].destination = &(opts->auth_require_ssl);
+    cv[11].destination = &(opts->auth_cookie_secure);
+    cv[12].destination = opts->auth_cookie_name;
+    cv[13].destination = opts->auth_cookie_domain;
+    cv[14].destination = opts->auth_cookie_expires_conf;
+    cv[15].destination = opts->auth_back_cookie_name;
+    cv[16].destination = opts->auth_back_arg_name;
+    cv[17].destination = opts->auth_guest_user;
+    cv[18].destination = &(opts->auth_guest_login);
+    cv[19].destination = &(opts->auth_guest_cookie);
+    cv[20].destination = &(opts->auth_guest_fallback);
+    cv[21].destination = opts->auth_tokens;
+
+    if (0 != config_insert_values_global(srv, da->value, cv, T_CONFIG_SCOPE_CONNECTION)) {
+        return 0;
+    }
+
+    /* check scalar config elements */
+    if (opts->auth_require_ssl) {
+        if (-1 == opts->auth_cookie_secure) {
+            /* Backwards compatibility mode for require-ssl */
+            /* Set secure_cookie flag if require-ssl is set
+             * and secure_cookie is undefined (as opposed to 'off') */
+          #if 0 /* noisy; must explicitly configure if insecure desired */
+            log_error_write(srv, __FILE__, __LINE__, "s",
+                "WARNING: require-ssl on, but no cookie-secure found - "
+                "please set cookie-secure explicitly; assuming 'enabled'");
+          #endif
+            opts->auth_cookie_secure = 1;
+        }
+    }
+    if (!buffer_string_is_empty(opts->auth_timeout_conf)) {
+        char *msg = convert_to_seconds(opts->auth_timeout_conf, &(opts->auth_timeout));
+        if (msg) {
+            log_error_write(srv, __FILE__, __LINE__, "s", msg);
+            return 0;
+        }
+    }
+    if (!buffer_string_is_empty(opts->auth_timeout_refresh_conf)) {
+        /* The timeout refresh is a double between 0 and 1, signifying what
+         * proportion of the timeout should be left before we refresh i.e.
+         * 0 means never refresh (hard timeouts); 1 means always refresh;
+         * .33 means only refresh if less than a third of the timeout
+         * period remains. */
+        double refresh = atof(opts->auth_timeout_refresh_conf->ptr);
+        if (refresh < 0.0 || refresh > 1.0) {
+            log_error_write(srv, __FILE__, __LINE__, "s", "refresh must be between 0.0 and 1.0");
+            return 0;
+        }
+        opts->auth_timeout_refresh = (int)(refresh * opts->auth_timeout);
+    }
+    if (!buffer_string_is_empty(opts->auth_cookie_expires_conf)) {
+        char *msg = convert_to_seconds(opts->auth_cookie_expires_conf, &(opts->auth_cookie_expires));
+        if (msg) {
+            log_error_write(srv, __FILE__, __LINE__, "ss", "cookie_expires ", msg);
+            return 0;
+        }
+    }
+    if (!buffer_string_is_empty(opts->auth_digest_type_conf)) {
+        /* MAX_DIGEST_LENGTH must be defined at top of file to largest supported digest */
+        if (0 == buffer_is_equal_string(opts->auth_digest_type_conf, CONST_STR_LEN(""))) {
+            opts->auth_digest_fn = ticket_digest_MD5;
+            opts->auth_digest_len = MD5_DIGEST_LENGTH;
+        }
+      #ifdef USE_OPENSSL_CRYPTO
+        else if (0 == buffer_is_equal_string(opts->auth_digest_type_conf, CONST_STR_LEN("SHA256"))) {
+            opts->auth_digest_fn = ticket_digest_SHA256;
+            opts->auth_digest_len = SHA256_DIGEST_LENGTH;
+        }
+        else if (0 == buffer_is_equal_string(opts->auth_digest_type_conf, CONST_STR_LEN("SHA512"))) {
+            opts->auth_digest_fn = ticket_digest_SHA512;
+            opts->auth_digest_len = SHA512_DIGEST_LENGTH;
+        }
+      #endif
+        else {
+          #ifdef USE_OPENSSL_CRYPTO
+            log_error_write(srv, __FILE__, __LINE__, "s", "digest-type must be one of: \"MD5\", \"SHA256\", \"SHA512\"");
+          #else
+            log_error_write(srv, __FILE__, __LINE__, "s", "digest-type must be: \"MD5\" (Rebuild lighttpd with crypo libs for additional options.)");
+          #endif
+            return 0;
+        }
+    }
+    /*
+     * "tokens" = ( "<path>" => ( ..., ... ),
+     *              "<path>" => ( ..., ... ) )
+     */
+    if (array_is_kvarray(opts->auth_tokens)) {
+        array *t = opts->auth_tokens;
+        for (size_t i = 0; i < t->used; ++i) {
+            if (!array_is_vlist(((data_array *)t->data[i])->value)) {
+                log_error_write(srv, __FILE__, __LINE__, "s",
+                    "unexpected value for tokens.  "
+                    "tokens should contain an array as in: "
+                    "\"tokens\" = ( \"path\" => ( \"token1\", \"token2\") )");
+                return 0;
+            }
+        }
+    }
+    else {
+        log_error_write(srv, __FILE__, __LINE__, "s",
+            "unexpected value for tokens.  "
+            "tokens should contain an array as in: "
+            "\"tokens\" = ( \"path\" => ( \"token1\", \"token2\") )");
+        return 0;
+    }
+
+    return 1;
 }/*}}}*/
 
-static int check_tokens(array *tokens)/*{{{*/
+SETDEFAULTS_FUNC(mod_authn_tkt_set_defaults) /*{{{*/
 {
-	size_t i;
-	for (i = 0; i < tokens->used; i++) {
-		if (tokens->data[i]->type != TYPE_STRING) {
-			return i;
-		}
-	}
-	return -1;
-}/*}}}*/
+    mod_authn_tkt_plugin_data *p = p_d;
 
-SETDEFAULTS_FUNC(mod_auth_tkt_set_defaults) /*{{{*/
-{
-	mod_auth_tkt_plugin_data *p = p_d;
-	size_t i;
-	
-	config_values_t cv[] = { 
-		{ "auth_tkt.secret",                    NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION }, /* 0 */
-		{ "auth_tkt.login_url",                 NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.timeout_url",               NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.post_timeout_url",          NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.unauth_url",                NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.guest_login",               NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.guest_cookie",              NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.guest_user",                NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.timeout",                   NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.timeout_refresh",           NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.cookie_name",               NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION }, /* 10 */
-		{ "auth_tkt.domain",                    NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.cookie_expires",            NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.back_arg_name",             NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.back_cookie_name",          NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.ignore_ip",                 NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.require_ssl",               NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.cookie_secure",             NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.require",                   NULL, T_CONFIG_LOCAL, T_CONFIG_SCOPE_CONNECTION },
-		{ "auth_tkt.debug",                     NULL, T_CONFIG_SHORT, T_CONFIG_SCOPE_CONNECTION },  /* 19 */
-		{ NULL,                                 NULL, T_CONFIG_UNSET, T_CONFIG_SCOPE_UNSET }
-	};
-	
-	p->config_storage = calloc(1, srv->config_context->used * sizeof(specific_config *));
-	assert(p->config_storage);
+    config_values_t cv[] = {
+        { "auth.method.tkt.opts", NULL, T_CONFIG_LOCAL, T_CONFIG_SCOPE_CONNECTION },
+        { NULL,                   NULL, T_CONFIG_UNSET, T_CONFIG_SCOPE_UNSET }
+    };
 
-	for (i = 0; i < srv->config_context->used; i++) {
-		mod_auth_tkt_plugin_config *s;
-		size_t n;
-		data_array *da;
-		array *ca;
-		char *msg;
-		
-		s = calloc(1, sizeof(mod_auth_tkt_plugin_config));
-		assert(s);
+    p->config_storage = calloc(1, srv->config_context->used * sizeof(specific_config *));
+    force_assert(p->config_storage);
 
-		s->auth_require = array_init();
+    for (size_t i = 0; i < srv->config_context->used; ++i) {
+        array *ca = ((data_config *)srv->config_context->data[i])->value;
+        data_array *da;
+        mod_authn_tkt_plugin_config *s = calloc(1, sizeof(mod_authn_tkt_plugin_config));
+        force_assert(s);
+        p->config_storage[i] = s;
 
-		s->auth_secret = buffer_init();
-		s->auth_login_url = buffer_init();
-		s->auth_timeout_url = buffer_init();
-		s->auth_post_timeout_url = buffer_init();
-		s->auth_unauth_url = buffer_init();
-		
-		s->auth_guest_user = buffer_init();
-		s->auth_timeout_conf = buffer_init();
-		s->auth_timeout_refresh_conf = buffer_init();
-		s->auth_cookie_name = buffer_init();
-		s->auth_domain = buffer_init(); 
-		s->auth_cookie_expires_conf = buffer_init();
-		s->auth_back_arg_name = buffer_init();
-		s->auth_back_cookie_name = buffer_init();
-
-		s->auth_guest_login = 0;
-		s->auth_guest_cookie = 0;
-		s->auth_ignore_ip = 0;
-		s->auth_require_ssl = 0;
-		s->auth_cookie_secure = -1;
-		s->auth_debug = 0;
-		
-		cv[0].destination = s->auth_secret;
-		cv[1].destination = s->auth_login_url;
-		cv[2].destination = s->auth_timeout_url;
-		cv[3].destination = s->auth_post_timeout_url;
-		cv[4].destination = s->auth_unauth_url;
-		cv[5].destination = &(s->auth_guest_login);
-		cv[6].destination = &(s->auth_guest_cookie);
-		cv[7].destination = s->auth_guest_user;
-		cv[8].destination = s->auth_timeout_conf;
- 		cv[9].destination = s->auth_timeout_refresh_conf;
- 		cv[10].destination = s->auth_cookie_name;
-		cv[11].destination = s->auth_domain;
-		cv[12].destination = s->auth_cookie_expires_conf;
-		cv[13].destination = s->auth_back_arg_name;
-		cv[14].destination = s->auth_back_cookie_name;
-		cv[15].destination = &(s->auth_ignore_ip);
-		cv[16].destination = &(s->auth_require_ssl);
-		cv[17].destination = &(s->auth_cookie_secure);
-		cv[18].destination = s->auth_require;
-		cv[19].destination = &(s->auth_debug);
-		
-		p->config_storage[i] = s;
-		ca = ((data_config *)srv->config_context->data[i])->value;
-		
-		if (0 != config_insert_values_global(srv, ca, cv)) {
-			return HANDLER_ERROR;
-		}
-		
-		/* check scalar config elements */
-		if (!buffer_is_empty(s->auth_timeout_conf)) {
-			s->auth_timeout = 0;
-			msg = set_auth_tkt_timeout(s->auth_timeout_conf, &(s->auth_timeout));
-			if (msg) {
-				log_error_write(srv, __FILE__, __LINE__, "ss", 
-						"mod_auth_tkt: ", msg);
-				return HANDLER_ERROR;
-			}
-		}
-		if (!buffer_is_empty(s->auth_timeout_refresh_conf)) {
-			msg = set_auth_tkt_timeout_refresh(s->auth_timeout_refresh_conf, &(s->auth_timeout_refresh)); 
-			if (msg) {
-				log_error_write(srv, __FILE__, __LINE__, "ss", 
-						"mod_auth_tkt: ", msg);
-				return HANDLER_ERROR;
-			}
-		}
-		s->auth_cookie_expires = 0;
-		if (!buffer_is_empty(s->auth_cookie_expires_conf)) {
-			msg = set_auth_tkt_timeout(s->auth_cookie_expires_conf, &(s->auth_cookie_expires));
-			if (msg) {
-				log_error_write(srv, __FILE__, __LINE__, "ss", 
-						"mod_auth_tkt: cookie_expires ", msg);
-				return HANDLER_ERROR;
-			}
-		}
-
-		/* no auth_tkt.require for this section */
-		if (NULL == (da = (data_array *)array_get_element(ca, "auth_tkt.require"))) continue;
-		
-		if (da->type != TYPE_ARRAY) {
-			log_error_write(srv, __FILE__, __LINE__, "sss", 
-					"unexpected type for key: ", "auth_tkt.require", "array of strings");
-			
-			return HANDLER_ERROR;
-		}
-		
-		/* 
-		 * auth_tkt.require = ( "<path>" => ( ... ), 
-		 *                      "<path>" => ( ... ) )
-		 */
-		for (n = 0; n < da->value->used; n++) {
-			size_t m;
-			data_array *da_path = (data_array *)da->value->data[n];
-			char *require_str;
-			data_array *require_arr;
-			data_array *tokens = NULL;
-			data_array *require = NULL;
-			
-			if (da->value->data[n]->type != TYPE_ARRAY) {
-				log_error_write(srv, __FILE__, __LINE__, "ss", 
-						"auth_tkt.require should contain an array as in:", 
-						"auth_tkt.require = ( \"...\" => ( ..., ...) )");
-
-				return HANDLER_ERROR;
-			}
-					
-			for (m = 0; m < da_path->value->used; m++) {
-				if (0 == strcmp(da_path->value->data[m]->key->ptr, "require")) {
-				    switch(da_path->value->data[m]->type) {
-					case TYPE_STRING:
-						require_str = ((data_string *)(da_path->value->data[m]))->value->ptr;
-						if (strcmp(require_str, "valid-user") == 0) {
-						    /* empty array for any valid user */
-						    require = data_array_init();
-						    buffer_copy_string(require->key, "require");
-						} else {
-						    log_error_write(srv, __FILE__, __LINE__, "ss", 
-							    "only 'valid-user' string is accepted for require. Use array for list of users:", 
-							    "auth_tkt.require = ( \"...\" => ( \"require\" => (\"...\", ...) )");
-
-						    return HANDLER_ERROR;
-						}
-						break;
-					case TYPE_ARRAY:
-						require_arr = (data_array *)(da_path->value->data[m]);
-						require = (data_array *)require_arr->copy((data_unset *)require_arr);
-						break;
-					default:
-						log_error_write(srv, __FILE__, __LINE__, "ss", 
-							"a string was expected for:", 
-							"auth_tkt.require = ( \"...\" => ( \"require\" => \"...\", ... )");
-
-						return HANDLER_ERROR;
-				    }
-				} else if (0 == strcmp(da_path->value->data[m]->key->ptr, "tokens")) {
-					if (da_path->value->data[m]->type == TYPE_ARRAY) {
-						int pos;
-						tokens = (data_array *)(da_path->value->data[m]);
-						pos = check_tokens(tokens->value);
-						if (pos != -1) {
-							log_error_write(srv, __FILE__, __LINE__, "sssd", 
-								"a string was expected for:", 
-								"auth_tkt.require = ( \"...\" => ( ..., \"tokens\" => (\"...\", \"...\"), ...",
-								"at index ", pos);
-							return HANDLER_ERROR;
-						}
-					} else {
-						log_error_write(srv, __FILE__, __LINE__, "ss", 
-							"an array was expected for:", 
-							"auth_tkt.require = ( \"...\" => ( \"tokens\" => \"...\", ... )");
-
-						return HANDLER_ERROR;
-					}
-				} else {
-					log_error_write(srv, __FILE__, __LINE__, "ssbs", 
-						"the field is unknown in:", 
-						"auth_tkt.require = ( \"...\" => ( ..., -> \"",
-						da_path->value->data[m]->key,
-						"\" <- => \"...\" ) )");
-
-					return HANDLER_ERROR;
-				}
-			}
-					
-			if (require == NULL) {
-				log_error_write(srv, __FILE__, __LINE__, "ss", 
-						"the require field is missing in:", 
-						"auth_tkt.require = ( \"...\" => ( ..., \"require\" => \"...\" ) )");
-				return HANDLER_ERROR;
-			}
-			
-			/* setup config */
-			{
-			    data_array *a;
-			    
-			    a = data_array_init();
-			    buffer_copy_string_buffer(a->key, da_path->key);
-			    
-			    array_insert_unique(a->value, (data_unset *)require);
-			    
-			    if (tokens) {
-				    array_insert_unique(a->value, (data_unset *)(tokens->copy((data_unset *)tokens)));
-			    }
-			    array_insert_unique(s->auth_require, (data_unset *)a);
-			}
-		}
+        if (0 == i) {
+            s->auth_opts = plugin_config_init_defaults();
+            buffer_copy_string_len(s->auth_opts->auth_cookie_name,
+                           CONST_STR_LEN(AUTH_COOKIE_NAME));
         }
 
-        return HANDLER_GO_ON;
+        cv[0].destination = NULL;
+
+        if (0 != config_insert_values_global(srv, ca, cv, i == 0 ? T_CONFIG_SCOPE_SERVER : T_CONFIG_SCOPE_CONNECTION)) {
+            return HANDLER_ERROR;
+        }
+
+        da = (data_array *)
+          array_get_element_klen(ca,CONST_STR_LEN("auth.method.tkt.opts"));
+        if (NULL != da) {
+            if (0 != i) s->auth_opts = plugin_config_init_defaults();
+            if (!parse_opts(srv, s->auth_opts, da)) return HANDLER_ERROR;
+        }
+    }
+
+    return HANDLER_GO_ON;
 }/*}}}*/
 
-int mod_auth_tkt_plugin_init(plugin *p) /*{{{*/
+int mod_authn_tkt_plugin_init(plugin *p);
+int mod_authn_tkt_plugin_init(plugin *p) /*{{{*/
 {
 	p->version     = LIGHTTPD_VERSION_ID;
-	p->name        = buffer_init_string("auth_tkt");
-	p->init        = mod_auth_tkt_init;
-	p->set_defaults = mod_auth_tkt_set_defaults;
-	p->handle_uri_clean = mod_auth_tkt_uri_handler;
-	p->cleanup     = mod_auth_tkt_free;
-	
+	p->name        = buffer_init_string("authn_tkt");
+	p->init        = mod_authn_tkt_init;
+	p->set_defaults= mod_authn_tkt_set_defaults;
+	p->cleanup     = mod_authn_tkt_free;
+
 	p->data        = NULL;
-	
+
 	return 0;
 }/*}}}*/

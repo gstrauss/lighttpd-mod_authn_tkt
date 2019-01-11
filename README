@@ -1,176 +1,206 @@
 
 ========
-mod_auth_tkt for Lighttpd
+mod_authn_tkt for Lighttpd
 ========
 
-:author: Mars Agliullin
-:Date: $Date: 2007/24/12 23:49:54 $
-:Revision: $Revision: 0.2.0 $
 
 Overview
 ========
 
-mod_auth_tkt provides secure cookie-based authentification for Lighttpd. 
-It is a port of Apache module of the same name. 
+mod_authn_tkt provides secure cookie-based authentification for Lighttpd.
+It is a port of Apache module of the same name.
 
 Basically it works as follows:
 1) User tries to access a restricted URI
-2) mod_auth_tkt checks if the request contains a valid ticket in a cookie
+2) mod_authn_tkt checks if the request contains a valid ticket in a cookie
    with predetermined name. If not, module redirects the user to login URI
    setting reference to the original page via URI parameter or another cookie
-3) At the login URI the user is authentified and is given a ticket (a cookie 
+3) At the login URI the user is authentified and is given a ticket (a cookie
    is set)
 4) Original page can be accessed as long as ticket is valid and not expired
 5) Valid ticket is periodically refreshed on subsequent requests of protected
    pages
 
-More information may be found at the homepage of the original Apache module: 
+More information may be found at the homepage of the original Apache module:
 http://www.openfusion.com.au/labs/mod_auth_tkt
 
-The module was tested against lighttpd 1.4.11, 1.4.18 on Ubuntu 6.06 and Cygwin.
+
+Directives
+==========
+
+auth.method.tkt.opts = ( <options> )
+	all options are collected into a single directive to attempt to
+	keep auth site config and policy together.  mod_auth auth.require
+	directive is used to set the authorized users config and to employ
+	mod_authn_tkt
+
 
 Options
 =======
 
-auth_tkt.secret - string, required 
+"secret" - string, required
 	secret component of MD5 hash
 
-auth_tkt.login_url - string, required 
-	unauthorized requests are redirected to this URI 
+"secret-old" - string, optional
+	(previous) secret component of MD5 hash
 
-auth_tkt.timeout_url - string, default=auth_tkt.login_url
+"login-url" - string, required
+	unauthorized requests are redirected to this URI
+
+"timeout-url" - string, default="login-url"
 	requests that send tickets with timestamp older than specified in
-	auth_tkt.timeout are redirected to this URI 
+	"timeout" are redirected to this URI
 
-auth_tkt.post_timeout_url - string, default=auth_tkt.timeout_url
+"post-timeout-url" - string, default="timeout_url"
 	requests that send tickets with timestamp older than specified in
-	auth_tkt.timeout via POST are redirected to this URI 
+	"timeout" via POST are redirected to this URI
 
-auth_tkt.unauth_url - string, default=auth_tkt.login_url
-	requests that send tickets without required tokens are redirected 
-        to this URI 
+"unauth-url" - string, default="login_url"
+	requests that send tickets without required tokens are redirected
+	to this URI
 
-auth_tkt.guest_login - string, optional
-	not supported yet
-
-auth_tkt.guest_cookie - string, optional
-	not supported yet
-
-auth_tkt.guest_user - string, optional
-	not supported yet
-
-auth_tkt.timeout - string, default=7200
+"timeout" - string, default=7200
 	period of time before ticket is considered expired (not the same
-	as cookie expiration - it is protected by MD5 hash). 
-        Last char of the string may be one of:
-	m, h, d, w, M, y 
-        to specify minutes, hours, days, weeks, months and years respectively. 
-        With no char the setting is treated to be in seconds.
+	as cookie expiration - it is protected by MD5 hash).
+	Last char of the string may be one of:
+	m, h, d, w, M, y
+	to specify minutes, hours, days, weeks, months and years respectively.
+	With no char the setting is treated to be in seconds.
 
-auth_tkt.timeout_refresh - float, default=0
-	From documentation of mod_auth_tkt for Apache: 
+"timeout-refresh" - float, default=0
+	From documentation of mod_auth_tkt for Apache:
 	"A number between 0 and 1 indicating whether and how to refresh ticket
 	timestamps. 0 means never refresh (hard timeouts). 1 means refresh
 	tickets every time. .33 (for example) means refresh if less than .33
 	of the timeout period remains."
 
-auth_tkt.cookie_name - string, default=auth_tkt
+"digest-type" - string, default="MD5"
+	Digest used in cookie.
+	"SHA256" or "SHA512" available if module linked with openssl libcrypto
+
+"ignore-ip" - boolean, default=disable
+	If set, client's IP is included in ticket.
+
+"require-ssl" - boolean, default=disable
+	If set, ignore tickets that are sent over clear HTTP
+
+"cookie-secure" - boolean, default=disable
+	Whether to set 'Secure' flag on ticket cookies
+	(default=enabled when "require-ssl" is enabled)
+
+"cookie-name" - string, default="auth_tkt"
 	ticket is set as a cookie with this name
 
-auth_tkt.domain - string, default=<value of server.name option>
+"cookie-domain" - string, default=<value of server.name option>
 	'Domain' field of the ticket cookie
 
-auth_tkt.cookie_expires - string, default=0
-	'Expires' field of the ticket cookie. Format is the same as 
-        auth_tkt.timeout
+"cookie-expires" - string, default=0
+	'Expires' field of the ticket cookie. Format is the same as
+	"timeout"
 
-auth_tkt.back_arg_name - string, default=back
-	From documentation of mod_auth_tkt for Apache: 
-	"will add a GET parameter to all redirect URLs containing a URI-escaped 
-	version of the current requested page e.g. if the requested page is 
-	http://www.example.com/index.html and TKTAuthBackArgName is set to 
+"back-cookie-name" - string, optional
+	If set, cookie with this name is used instead of GET parameter,
+	to remember the requested page
+
+"back-arg-name" - string, default=back
+	From documentation of mod_auth_tkt for Apache:
+	"will add a GET parameter to all redirect URLs containing a URI-escaped
+	version of the current requested page e.g. if the requested page is
+	http://www.example.com/index.html and "back-arg-name" is set to
 	'back', mod_auth_tkt will add a parameter like:
 
 	  back=http%3A%2F%2Fwww.example.com%2Findex.html
 
-	to the TKTAuthLoginURL it redirects to, allowing your login script
+	to the "login-url" it redirects to, allowing your login script
 	to redirect back to the requested page upon successful login."
 
-auth_tkt.back_cookie_name - string, optional
-	If set, cookie with this name is used instead of GET parameter, 
-        to remember the requested page
+"guest-user" - string, default="guest"
+	guest username
+	If string contains %U or %<digits>U, then that will be substituted
+	in guest username string with random hex chars (1 - 32 hex chars)
 
-auth_tkt.ignore_ip - boolean, default=disabled
-	If set, client's IP is included in ticket.
+"guest-login" - boolean, default=disable
+	permit guest login (if cookie is invalid or missing)
 
-auth_tkt.require_ssl - boolean, default=disabled
-	If set, ignore tickets that are sent over clear HTTP
- 
-auth_tkt.cookie_secure - boolean, default=enabled
-	Whether to set 'Secure' flag on ticket cookies
+"guest-cookie" - boolean, default=disable
+	create cookie for guestnot supported yet
 
-auth_tkt.require - array of URIs with restricted access
-	Every entry of this array should have "require" key, that contains
-	list of allowed usernames or string "valid-user"; and optional
-	key "tokens", that, if set, should be a list of strings. If "tokens"
-	is set, user is allowed to access resource only if his/her ticket has
+"guest-fallback" - boolean, default=disable
+	fallback to guest login if cookie expired
+
+"tokens" - list, default=(), optional
+	List of URL-path prefixes and additional required authorization tokens
+	If a URL-path matches a prefix and target list of string is not empty,
+	then user is allowed to access resource only if his/her ticket has
 	any of the specified tokens.
-
-auth_tkt.debug - integer, default=0
- 	If set, show debug information in the logs. Currently levels 0, 1, 2
-	are meaningful
 
 
 Samples
 =======
-# it is required to include mod_auth  _before_  mod_auth_tkt
 server.modules  = (
 ...
-                               "mod_auth",
-                               "mod_auth_tkt",
+                   "mod_auth",
+                   "mod_authn_tkt",
 ...
 )
 
-auth_tkt.debug = 1
-auth_tkt.secret = "longlonglongsecretkey"
-auth_tkt.login_url = "https://www.example.org/login.html"
-auth_tkt.timeout_url = "https://www.example.org/login.html?timeout=1 "
-auth_tkt.post_timeout_url = "https://www.example.org/login.html?posttimeout=1"
-auth_tkt.unauth_url = " https://www.example.org/login.html?unauth=1"
-auth_tkt.guest_login = "disable"
-auth_tkt.guest_cookie = "disable"
-auth_tkt.guest_user = "guest-%12U"
-auth_tkt.timeout = "20m"
-auth_tkt.timeout_refresh = ".25"
-auth_tkt.cookie_name = "auth_tkt_cookie"
-auth_tkt.domain = "example.org"
-auth_tkt.cookie_expires = "20m"
-auth_tkt.back_arg_name = "back"
-auth_tkt.back_cookie_name = "auth_tkt_back_cookie"
-auth_tkt.ignore_ip = "disable"
-auth_tkt.require_ssl = "enable"
-auth_tkt.cookie_secure = "enable"
-auth_tkt.require = ("/protected.txt" =>
-                       (
-                           "require" => "valid-user",
-                           "tokens" => ("token1", "token2", "admin")
-                       ),
-                    "/fortified.txt" =>
-                       (
-                           "require" => ("admin"),
-                       ),
-                    "/keep.txt" =>
-                       (
-                           "require" => ("user", "admin"),
-                           "tokens" => ("powerful")
-                       )
-                   )
+
+# (sample mod_authn_tkt config)
+auth.method.tkt.opts = (
+    "secret" = "longlonglongsecretkey"
+    "secret-old" = "previously-rotated-longlonglongsecretkey"
+    "login-url" = "https://www.example.org/login.html"
+    "timeout-url" = "https://www.example.org/login.html?timeout=1 "
+    "post-timeout-url" = "https://www.example.org/login.html?posttimeout=1"
+    "unauth-url" = "https://www.example.org/login.html?unauth=1"
+    "timeout" = "20m"
+    "timeout-refresh" = ".25"
+    "digest-type" = "MD5"  # "MD5", "SHA256", or "SHA512"
+    "ignore-ip" = "disable"
+    "require-ssl" = "enable"
+    "cookie-secure" = "enable"
+    "cookie-name" = "auth_tkt"
+    "cookie-domain" = "example.org"
+    "cookie-expires" = "20m"
+    "back-arg-name" = "back"
+    "back-cookie-name" = "auth_tkt_back"
+    "guest-user" = "guest-%16U"
+    "guest-login" = "disable"
+    "guest-cookie" = "disable"
+    "guest-fallback" = "disable"
+    "tokens" = ("/protected-folder/protected.txt" => ("token1", "admin"),
+                "/download/"                      => ("downloader")
+                "/server-info"                    => ("admin")
+               )
+)
+
+# (sample mod_auth config to use mod_authn_tkt.  Note: "method" => "authn_tkt")
+auth.require = ( "/download/" =>
+                 (
+                   "method"  => "authn_tkt",
+                   "realm"   => "ignored-for-authn-tkt", # must be non-empty
+                   "require" => "user=agent007|user=agent008"
+                 ),
+                 "/server-info" =>
+                 (
+                   # limit access to valid user with "admin" token (above)
+                   "method"  => "authn_tkt",
+                   "realm"   => "ignored-for-authn-tkt", # must be non-empty
+                   "require" => "valid-user"
+                 )
+                 "/protected-folder/" =>
+                 (
+                   # limit access to valid user
+                   # additionally require tokens for protected.txt (above)
+                   "method"  => "authn_tkt",
+                   "realm"   => "ignored-for-authn-tkt", # must be non-empty
+                   "require" => "valid-user"
+                 )
+               )
+
 
 TODO
 ====
 
 - tests
-- ticket forwarding as URI argument
-- guest users support
-- IPv6 support
 
