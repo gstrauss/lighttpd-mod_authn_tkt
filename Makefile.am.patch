@@ -1,0 +1,14 @@
+--- f:\src\lighttpd-1.4.18\src\Makefile.am	Mon Sep 03 03:23:53 2007
++++ f:\src\lighttpd-1.4.17\src\Makefile.am	Mon Sep 24 21:08:44 2007
+@@ -221,6 +219,11 @@
+ mod_auth_la_LDFLAGS = -module -export-dynamic -avoid-version -no-undefined
+ mod_auth_la_LIBADD = $(CRYPT_LIB) $(LDAP_LIB) $(LBER_LIB) $(common_libadd)
+ 
++lib_LTLIBRARIES += mod_auth_tkt.la
++mod_auth_tkt_la_SOURCES = mod_auth_tkt.c http_auth_digest.c http_auth.c
++mod_auth_tkt_la_LDFLAGS = -module -export-dynamic -avoid-version -no-undefined
++mod_auth_tkt_la_LIBADD = $(CRYPT_LIB) $(LDAP_LIB) $(LBER_LIB) $(common_libadd)
++
+ lib_LTLIBRARIES += mod_rewrite.la
+ mod_rewrite_la_SOURCES = mod_rewrite.c
+ mod_rewrite_la_LDFLAGS = -module -export-dynamic -avoid-version -no-undefined
