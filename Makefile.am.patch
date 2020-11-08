@@ -1,6 +1,6 @@
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
-@@ -380,6 +380,11 @@
+@@ -382,6 +382,11 @@
  mod_authn_sasl_la_CPPFLAGS = $(SASL_CFLAGS)
  endif
  

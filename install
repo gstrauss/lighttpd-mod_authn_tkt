@@ -1,9 +1,0 @@
-$(LIGHTTPD) is the root of lighttpd sources
-
-1) cp mod_auth_tkt.c Makefile.am.patch $(LIGHTTPD)/src
-2) cd $(LIGHTTPD)/src
-2) patch Makefile.am Makefile.am.patch
-3) cd ..
-4) automake
-
-then usual configure; make; make install
