@@ -10,6 +10,9 @@
  *           https://github.com/gavincarr/mod_auth_tkt
  *           License: Apache License 1.0
  */
+/*
+ * mod_authn_tkt version 0.02
+ */
 #include "first.h"
 
 #include <stdlib.h>
@@ -46,10 +49,11 @@
 #define MAX_DIGEST_LENGTH MD5_DIGEST_LENGTH
 #endif
 
-#define TIMESTAMP_HEXLEN 8  /*(assumes 32-bit time_t)*/
+#define TIMESTAMP_HEXLEN 8  /*(unsigned 32-bit (4 bytes) in hex)*/
 
 #define TIME_T_MAX (~((time_t)1 << (sizeof(time_t)*CHAR_BIT-1)))
 
+typedef void (*digest_fn_t)(struct authn_tkt_struct *,uint32_t,const buffer *);
 
 typedef struct authn_tkt_struct {
 	buffer uid;
@@ -58,9 +62,9 @@ typedef struct authn_tkt_struct {
 	buffer tmp_buf;
 	buffer *addr_buf; /* not allocated */
 	int refresh_cookie;
-	time_t timestamp;
+	uint32_t timestamp; /* unsigned 32-bit big-endian value for time_t */
 	unsigned int digest_len;
-        void (*digest_fn)(struct authn_tkt_struct *, time_t, const buffer *);
+	digest_fn_t digest_fn;
 	unsigned char digest[MAX_DIGEST_LENGTH];
 } authn_tkt;
 
@@ -80,7 +84,7 @@ typedef struct {
 	const buffer *auth_guest_user;
 	const array *auth_tokens;
 
-        void (*auth_digest_fn)(struct authn_tkt_struct *,time_t,const buffer *);
+	digest_fn_t auth_digest_fn;
 	uint8_t auth_digest_len;
 	uint8_t auth_ignore_ip;
 	int8_t auth_cookie_secure;
@@ -458,9 +462,8 @@ static handler_t authn_tkt_redirect(request_st * const r, const mod_authn_tkt_pl
 }/*}}}*/
 
 /* Generate a ticket digest string from the given details */
-static void ticket_digest_MD5(authn_tkt *parsed, time_t timestamp, const buffer *secret)/*{{{*/
+static void ticket_digest_MD5(authn_tkt *parsed, uint32_t ts, const buffer *secret)/*{{{*/
 {
-    uint32_t ts = htonl((uint32_t)timestamp); /*(assumes 32-bit time_t)*/
     MD5_CTX ctx;
 
     /* Generate the initial digest */
@@ -487,9 +490,8 @@ static void ticket_digest_MD5(authn_tkt *parsed, time_t timestamp, const buffer 
 }/*}}}*/
 
 #ifdef USE_LIB_CRYPTO_SHA256
-static void ticket_digest_SHA256(authn_tkt *parsed, time_t timestamp, const buffer *secret)/*{{{*/
+static void ticket_digest_SHA256(authn_tkt *parsed, uint32_t ts, const buffer *secret)/*{{{*/
 {
-    uint32_t ts = htonl((uint32_t)timestamp); /*(assumes 32-bit time_t)*/
     SHA256_CTX ctx;
 
     /* Generate the initial digest */
@@ -517,9 +519,8 @@ static void ticket_digest_SHA256(authn_tkt *parsed, time_t timestamp, const buff
 #endif
 
 #ifdef SHA512_DIGEST_LENGTH
-static void ticket_digest_SHA512(authn_tkt *parsed, time_t timestamp, const buffer *secret)/*{{{*/
+static void ticket_digest_SHA512(authn_tkt *parsed, uint32_t ts, const buffer *secret)/*{{{*/
 {
-    uint32_t ts = htonl((uint32_t)timestamp); /*(assumes 32-bit time_t)*/
     SHA512_CTX ctx;
 
     /* Generate the initial digest */
@@ -550,20 +551,17 @@ static void ticket_digest_SHA512(authn_tkt *parsed, time_t timestamp, const buff
 static void refresh_cookie(request_st * const r, const mod_authn_tkt_plugin_opts * const opts, authn_tkt * const parsed)/*{{{*/
 {
     time_t now = log_epoch_secs;
-    uint32_t ts = htonl((uint32_t)now); /*(assumes 32-bit time_t)*/
+    uint32_t ts = htonl((uint32_t)now);
     char sep[2] = { SEPARATOR, '\0' };
     buffer *ticket = r->tmp_buf, *ticket_base64 = &parsed->tmp_buf;
-    void(*ticket_digest)(authn_tkt *,time_t,const buffer *) = parsed->digest_fn;
+    digest_fn_t ticket_digest = parsed->digest_fn;
 
-    ticket_digest(parsed, now, opts->auth_secret);
+    ticket_digest(parsed, ts, opts->auth_secret);
     buffer_clear(ticket);
     buffer_append_string_encoded_hex_lc(ticket, (char *)parsed->digest,
                                         parsed->digest_len);
-  #if 1 /*(ensure full 8 hex chars emitted for 32-bit entity)*/
+    /*(ensure 8 hex chars emitted for 4 bytes of uint32_t)*/
     buffer_append_string_encoded_hex_lc(ticket, (char *)&ts, sizeof(ts));
-  #else
-    buffer_append_uint_hex_lc(ticket, (uintmax_t)now);
-  #endif
     buffer_append_string_buffer(ticket, &parsed->uid);
     if (!buffer_string_is_empty(&parsed->tokens)) {
         buffer_append_string_len(ticket, sep, 1);
@@ -586,8 +584,7 @@ static void refresh_cookie(request_st * const r, const mod_authn_tkt_plugin_opts
  */
 static int check_digest(const mod_authn_tkt_plugin_opts * const opts, authn_tkt * const auth_rec)/*{{{*/
 {
-    void(*ticket_digest)(authn_tkt *, time_t, const buffer *)
-      = auth_rec->digest_fn;
+    digest_fn_t ticket_digest = auth_rec->digest_fn;
     const size_t len = auth_rec->digest_len;
     unsigned char digest[MAX_DIGEST_LENGTH];
     memcpy(digest, auth_rec->digest, len);
@@ -630,8 +627,9 @@ static int check_digest(const mod_authn_tkt_plugin_opts * const opts, authn_tkt 
  * Returns 0 if timed out, 1 if OK, 2 if OK and trigger cookie refresh */
 static int check_timeout(const mod_authn_tkt_plugin_opts * const opts, authn_tkt * const parsed, const time_t now)/*{{{*/
 {
-    time_t expire = (TIME_T_MAX - parsed->timestamp > opts->auth_timeout)
-      ? parsed->timestamp + opts->auth_timeout
+    const time_t hts = (time_t)ntohl(parsed->timestamp);
+    time_t expire = (TIME_T_MAX - hts > opts->auth_timeout)
+      ? hts + opts->auth_timeout
       : TIME_T_MAX;
 
     /* Check if ticket expired */
@@ -865,7 +863,7 @@ static void plugin_config_init_defaults(mod_authn_tkt_plugin_opts * const opts) 
     /*memset(opts, 0, sizeof(mod_authn_tkt_plugin_opts));*/
     opts->auth_cookie_secure = -1;
     opts->auth_timeout = DEFAULT_TIMEOUT_SEC;
-    opts->auth_timeout_refresh = (int)(0.5 * DEFAULT_TIMEOUT_SEC);
+    opts->auth_timeout_refresh = DEFAULT_TIMEOUT_SEC / 2;
     opts->auth_digest_fn = ticket_digest_MD5;
     opts->auth_digest_len = MD5_DIGEST_LENGTH;
     opts->auth_cookie_name = &default_auth_cookie_name;
