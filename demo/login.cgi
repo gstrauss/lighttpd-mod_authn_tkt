@@ -5,8 +5,6 @@ It needed some modifications to work properly:
 - The IP must be encoded as a string (plone was using 4-bytes). The reason mod_authn_tkt
 does this is because an IP address might be IPv4 or it might be IPv6. An IPv6 address
 does not fit into 4 packed bytes (which is the size of an IPv4 address)
-- The timestamp must be encoded in little-endian (plone was using network/big-endian).
-This might be machine-dependent if your lighttpd is compiled for big-endian!
 - The first digest (digest0) used to calculate the final digest in mod_auth_tkt_digest()
 must be the 16-bytes array while the original used the hex-string
 """
@@ -56,8 +54,8 @@ def createTicket(secret, userid, tokens=(), user_data='', ip='0.0.0.0',
 
     token_list = b','.join(tokens)
     ##data1 = inet_aton(ip)[:4] + pack('!I', timestamp) # THIS line that was modified to work with lighttpd mod_authn_tkt
-    # Notice the difference is that 'ip' is used as a string and the timestamp is in little-endian instead of in network (big-endian)
-    data1 = ip + pack('<I', timestamp)
+    # Notice the difference is that 'ip' is used as a string
+    data1 = ip + pack('!I', timestamp)
     data2 = b''.join((userid, token_list, user_data))
     if mod_auth_tkt:
         digest = mod_auth_tkt_digest(secret, data1, data2)

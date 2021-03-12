@@ -22,7 +22,7 @@ typedef struct authn_tkt_struct {
 
 static void ticket_digest_MD5(authn_tkt *parsed, time_t timestamp, const char *secret)/*{{{*/
 {
-    uint32_t ts = ((uint32_t)timestamp); /*(assumes 32-bit time_t)*/
+    uint32_t ts = htonl(timestamp); /*(assumes 32-bit time_t)*/
     MD5_CTX ctx;
 
     /* Generate the initial digest */
