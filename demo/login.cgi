@@ -36,7 +36,7 @@ def mod_auth_tkt_digest(secret, data1, data2):
     if not six.PY2:
         # In Python 3 hashlib.md5(value).hexdigest() wants a bites value
         # and returns text
-        digest0 = digest0.encode()
+        digest0 = safe_encode(digest0)
     digest = hashlib.md5(digest0 + secret).hexdigest()
     return digest
 
@@ -55,7 +55,8 @@ def createTicket(secret, userid, tokens=(), user_data='', ip='0.0.0.0',
     token_list = b','.join(tokens)
     ##data1 = inet_aton(ip)[:4] + pack('!I', timestamp) # THIS line that was modified to work with lighttpd mod_authn_tkt
     # Notice the difference is that 'ip' is used as a string
-    data1 = ip + pack('!I', timestamp)
+    #data1 = ip + pack('!I', timestamp)
+    data1 = safe_encode(ip) + pack('!I', timestamp)
     data2 = b''.join((userid, token_list, user_data))
     if mod_auth_tkt:
         digest = mod_auth_tkt_digest(secret, data1, data2)
