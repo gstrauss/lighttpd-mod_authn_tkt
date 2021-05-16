@@ -11,7 +11,7 @@
  *           License: Apache License 1.0
  */
 /*
- * mod_authn_tkt version 0.02
+ * mod_authn_tkt version 0.03
  */
 #include "first.h"
 
@@ -320,37 +320,31 @@ static int authn_tkt_from_cookie(request_st * const r, mod_authn_tkt_plugin_data
     const buffer * const hdr =
       http_header_request_get(r, HTTP_HEADER_COOKIE, CONST_STR_LEN("Cookie"));
     if (NULL == hdr) return 0;
-    for (const char *start=hdr->ptr, *semi, *end; *start; start = semi+1) {
-        semi = strchr(start+1, ';');
-        if (0 != strncmp(start, name->ptr, nlen) || start[nlen] != '=') {
-            if (NULL == semi) break;
-            continue;
+    const char *str = hdr->ptr;
+    do { /*(modified from mod_accesslog.c:log_access_record() FORMAT_COOKIE)*/
+        while (*str == ' ' || *str == '\t') ++str;
+        if (0 == strncmp(str, name->ptr, nlen) && str[nlen] == '=') {
+            const char *v = str+nlen+1;
+            for (str = v; *str != '\0' && *str != ';'; ++str) ;
+            if (str == v) break;
+            do { --str; } while (str > v && (*str == ' ' || *str == '\t'));
+            /* remove double-quoting, if present (not needed for base64) */
+            if (*v == '"') {
+                ++v;
+                if (*str == '"') --str;
+            }
+            if (v < str) {
+                buffer * const result = &p->auth_rec.tmp_buf;
+                buffer_clear(result);
+                buffer_append_base64_decode(result,v,str-v+1,BASE64_STANDARD);
+                return parse_ticket(&p->auth_rec);
+            }
+            /* skip empty cookies (such as with misconfigured logoffs) */
         }
-
-        /* Cookie includes our cookie name - copy (first) value into result */
-        start += nlen + 1;
-        end = (NULL != semi)
-          ? semi - 1  /* end points at ';' we will not copy it! */
-          : hdr->ptr + buffer_string_length(hdr);
-
-        /* For some reason (some clients?), tickets sometimes come in quoted */
-        if (*start == '"') {
-            ++start;
-            if (end[-1] == '"') --end;
-        }
-
-        /* Skip empty cookies (such as with misconfigured logoffs) */
-        if (end == start) {
-            if (NULL == semi) break;
-            continue;
-        }
-        else {
-            buffer *result = &p->auth_rec.tmp_buf;
-            buffer_clear(result);
-            buffer_append_base64_decode(result,start,end-start,BASE64_STANDARD);
-            return parse_ticket(&p->auth_rec);
-        }
-    }
+        while (*str != ';' && *str != ' ' && *str != '\t' && *str != '\0')
+            ++str;
+        while (*str == ' ' || *str == '\t') ++str;
+    } while (*str++ == ';');
     return 0;
 }/*}}}*/
 
