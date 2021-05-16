@@ -573,7 +573,8 @@ static void refresh_cookie(request_st * const r, const mod_authn_tkt_plugin_opts
 
     buffer_clear(ticket_base64);
     buffer_append_base64_encode(ticket_base64,
-                                (unsigned char *)CONST_BUF_LEN(ticket),
+                                (unsigned char *)ticket->ptr,
+                                buffer_string_length(ticket),
                                 BASE64_STANDARD);
 
     send_auth_cookie(r, opts, opts->auth_cookie_name, ticket_base64, now);
