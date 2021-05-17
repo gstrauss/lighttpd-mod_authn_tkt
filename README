@@ -7,7 +7,7 @@ mod_authn_tkt for Lighttpd
 Overview
 ========
 
-mod_authn_tkt provides secure cookie-based authentification for Lighttpd.
+mod_authn_tkt provides secure cookie-based authentication for Lighttpd.
 It is a port of Apache module of the same name.
 
 Basically it works as follows:
@@ -15,7 +15,7 @@ Basically it works as follows:
 2) mod_authn_tkt checks if the request contains a valid ticket in a cookie
    with predetermined name. If not, module redirects the user to login URI
    setting reference to the original page via URI parameter or another cookie
-3) At the login URI the user is authentified and is given a ticket (a cookie
+3) At the login URI the user is authenticated and is given a ticket (a cookie
    is set)
 4) Original page can be accessed as long as ticket is valid and not expired
 5) Valid ticket is periodically refreshed on subsequent requests of protected

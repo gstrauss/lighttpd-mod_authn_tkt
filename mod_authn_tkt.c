@@ -11,7 +11,7 @@
  *           License: Apache License 1.0
  */
 /*
- * mod_authn_tkt version 0.04
+ * mod_authn_tkt version 0.05
  */
 #include "first.h"
 
@@ -24,7 +24,9 @@
 #include "base.h"
 #include "base64.h"
 #include "buffer.h"
-#include "http_auth.h"
+#include "ck.h"
+#include "mod_auth_api.h"
+#include "http_date.h"
 #include "http_header.h"
 #include "log.h"
 #include "plugin.h"
@@ -37,24 +39,10 @@
 #define DEFAULT_TIMEOUT_SEC 7200
 #define DEFAULT_GUEST_USER "guest"
 
-#ifndef MD5_DIGEST_LENGTH
-#define MD5_DIGEST_LENGTH 16
-#endif
-
-#if defined(SHA512_DIGEST_LENGTH)
-#define MAX_DIGEST_LENGTH SHA512_DIGEST_LENGTH
-#elif defined(USE_LIB_CRYPTO_SHA256)
-#define MAX_DIGEST_LENGTH SHA256_DIGEST_LENGTH
-#else
-#define MAX_DIGEST_LENGTH MD5_DIGEST_LENGTH
-#endif
-
 #define TIMESTAMP_HEXLEN 8  /*(unsigned 32-bit (4 bytes) in hex)*/
 
-#define TIME_T_MAX (~((time_t)1 << (sizeof(time_t)*CHAR_BIT-1)))
-
-struct authn_tkt_struct;
-typedef void (*digest_fn_t)(struct authn_tkt_struct *,uint32_t,const buffer *);
+/*#define TIME_T_MAX (~((time_t)1 << (sizeof(time_t)*CHAR_BIT-1)))*/
+#define TIME_T_MAX INT64_MAX
 
 typedef struct authn_tkt_struct {
 	buffer uid;
@@ -65,8 +53,8 @@ typedef struct authn_tkt_struct {
 	int refresh_cookie;
 	uint32_t timestamp; /* unsigned 32-bit big-endian value for time_t */
 	unsigned int digest_len;
-	digest_fn_t digest_fn;
-	unsigned char digest[MAX_DIGEST_LENGTH];
+	li_md_iov_fn digest_fn;
+	unsigned char digest[MD_DIGEST_LENGTH_MAX];
 } authn_tkt;
 
 
@@ -85,7 +73,7 @@ typedef struct {
 	const buffer *auth_guest_user;
 	const array *auth_tokens;
 
-	digest_fn_t auth_digest_fn;
+	li_md_iov_fn auth_digest_fn;
 	uint8_t auth_digest_len;
 	uint8_t auth_ignore_ip;
 	int8_t auth_cookie_secure;
@@ -181,14 +169,14 @@ static void mod_authn_tkt_patch_config(request_st * const r, mod_authn_tkt_plugi
 }/*}}}*/
 
 /* Send an auth cookie with given value; NULL value is flag to expire cookie */
-static void send_auth_cookie(request_st * const r, const mod_authn_tkt_plugin_opts * const opts, const buffer * const cookie_name, const buffer * const value, time_t now)/*{{{*/
+static void send_auth_cookie(request_st * const r, const mod_authn_tkt_plugin_opts * const opts, const buffer * const cookie_name, const buffer * const value, unix_time64_t now)/*{{{*/
 {
     buffer *cookie;
     const buffer *domain;
 
     http_header_response_insert(r, HTTP_HEADER_SET_COOKIE,
                                 CONST_STR_LEN("Set-Cookie"),
-                                CONST_BUF_LEN(cookie_name));
+                                BUF_PTR_LEN(cookie_name));
     cookie = http_header_response_get(r, HTTP_HEADER_SET_COOKIE,
                                       CONST_STR_LEN("Set-Cookie"));
   #ifdef __COVERITY__
@@ -196,16 +184,15 @@ static void send_auth_cookie(request_st * const r, const mod_authn_tkt_plugin_op
   #endif
 
     if (NULL != value) {
-        buffer_append_string_len(cookie, "=", 1);
-        buffer_append_string_buffer(cookie, value);
-        buffer_append_string_len(cookie, CONST_STR_LEN("; path=/"));
+        buffer_append_str3(cookie, CONST_STR_LEN("="),
+                                   BUF_PTR_LEN(value),
+                                   CONST_STR_LEN("; path=/"));
         if (opts->auth_cookie_expires > 0) {
             now = (TIME_T_MAX - now > opts->auth_cookie_expires)
                 ? now + opts->auth_cookie_expires
                 : TIME_T_MAX;
             buffer_append_string_len(cookie, CONST_STR_LEN("; expires="));
-            buffer_append_strftime(cookie, "%a, %d %b %Y %H:%M:%S GMT",
-                                   gmtime(&now));
+            http_date_time_append(cookie, now);
         }
     }
     else {
@@ -214,12 +201,12 @@ static void send_auth_cookie(request_st * const r, const mod_authn_tkt_plugin_op
     }
     /* (Apache mod_auth_tkt prefers X-Forwarded-Host to Host; not done here) */
     /* XXX: if using r->server_name, do we need to omit :port, if present? */
-    domain = buffer_string_is_empty(opts->auth_cookie_domain)
+    domain = !opts->auth_cookie_domain
       ? r->server_name
       : opts->auth_cookie_domain;
-    if (!buffer_string_is_empty(domain)) {
+    if (domain && !buffer_is_blank(domain)) {
         buffer_append_string_len(cookie, CONST_STR_LEN("; domain="));
-        buffer_append_string_encoded(cookie, CONST_BUF_LEN(domain),
+        buffer_append_string_encoded(cookie, BUF_PTR_LEN(domain),
                                      ENCODING_REL_URI);
     }
     if (opts->auth_cookie_secure > 0) {
@@ -240,15 +227,15 @@ static int parse_ticket(authn_tkt *parsed)/*{{{*/
     /* Basic length check for min size */
     if (sep - tkt < digest_hexlen + TIMESTAMP_HEXLEN) return 0;
 
-    if (0 != http_auth_digest_hex2bin(tkt, digest_hexlen,
-                                      parsed->digest, sizeof(parsed->digest))) {
+    if (0 != li_hex2bin(parsed->digest, sizeof(parsed->digest),
+                        tkt, digest_hexlen)) {
         return 0; /*(invalid hex encoding)*/
     }
 
     parsed->timestamp = 0;
-    if (0 != http_auth_digest_hex2bin(tkt+digest_hexlen, TIMESTAMP_HEXLEN,
-                                      (unsigned char *)&parsed->timestamp,
-                                      sizeof(parsed->timestamp))) {
+    if (0 != li_hex2bin((unsigned char *)&parsed->timestamp,
+                        sizeof(parsed->timestamp),
+                        tkt+digest_hexlen, TIMESTAMP_HEXLEN)) {
         return 0; /*(invalid hex encoding in timestamp)*/
     }
 
@@ -265,7 +252,7 @@ static int parse_ticket(authn_tkt *parsed)/*{{{*/
     /* Copy user data to parsed->user_data */
     ++sep;
     buffer_copy_string_len(&parsed->user_data, sep,
-                           tkt + buffer_string_length(&parsed->tmp_buf) - sep);
+                           tkt + buffer_clen(&parsed->tmp_buf) - sep);
 
     return 1;
 }/*}}}*/
@@ -275,9 +262,9 @@ static int parse_ticket(authn_tkt *parsed)/*{{{*/
 static int authn_tkt_from_querystring(request_st * const r, mod_authn_tkt_plugin_data * const p)/*{{{*/
 {
     const buffer * const name = p->conf.auth_opts->auth_cookie_name;
-    const size_t nlen = buffer_string_length(name);
+    const size_t nlen = buffer_clen(name);
     const char *qstr = r->uri.query.ptr;
-    if (buffer_string_is_empty(&r->uri.query)) return 0;
+    if (buffer_is_blank(&r->uri.query)) return 0;
     for (const char *start=qstr, *amp, *end; *start; start = amp+1) {
         amp = strchr(start+1, '&');
         if (0 != strncmp(start, name->ptr, nlen) || start[nlen] != '=') {
@@ -289,7 +276,7 @@ static int authn_tkt_from_querystring(request_st * const r, mod_authn_tkt_plugin
         start += nlen + 1;
         end = (NULL != amp)
           ? amp - 1  /* end points at '&' we will not copy it! */
-          : qstr + buffer_string_length(&r->uri.query);
+          : qstr + buffer_clen(&r->uri.query);
 
         /* For some reason (some clients?), tickets sometimes come in quoted */
         if (*start == '"') {
@@ -316,7 +303,7 @@ static int authn_tkt_from_querystring(request_st * const r, mod_authn_tkt_plugin
 static int authn_tkt_from_cookie(request_st * const r, mod_authn_tkt_plugin_data * const p)/*{{{*/
 {
     const buffer * const name = p->conf.auth_opts->auth_cookie_name;
-    const size_t nlen = buffer_string_length(name);
+    const size_t nlen = buffer_clen(name);
     const buffer * const hdr =
       http_header_request_get(r, HTTP_HEADER_COOKIE, CONST_STR_LEN("Cookie"));
     if (NULL == hdr) return 0;
@@ -353,7 +340,7 @@ static int authn_tkt_from_cookie(request_st * const r, mod_authn_tkt_plugin_data
 static void query_append_urlencoded(buffer *b, buffer *q, const buffer * const omit)/*{{{*/
 {
     char sep[] = "?";
-    char *qend = q->ptr + buffer_string_length(q);
+    char *qend = q->ptr + buffer_clen(q);
     for (char *qb = q->ptr, *qe; qb < qend; qb = qe+1) {
         qe = strchr(qb, '=');
         if (NULL == qe || !buffer_is_equal_string(omit, qb, (size_t)(qe-qb))) {
@@ -370,24 +357,24 @@ static void query_append_urlencoded(buffer *b, buffer *q, const buffer * const o
 
 static int authn_tkt_construct_back_urlencoded(request_st * const r, buffer * const back, const buffer * const strip_arg)/*{{{*/
 {
-    buffer_copy_buffer(back, &r->uri.scheme);
-    buffer_append_string_len(back, CONST_STR_LEN("://"));
     buffer * const tb = r->tmp_buf;
     buffer_clear(tb);
     if (0 != http_response_buffer_append_authority(r, tb))
         return 0;
-    buffer_append_string_encoded(back, CONST_BUF_LEN(tb),
+    buffer_clear(back);
+    buffer_append_str2(back, BUF_PTR_LEN(&r->uri.scheme), CONST_STR_LEN("://"));
+    buffer_append_string_encoded(back, BUF_PTR_LEN(tb),
                                  ENCODING_REL_URI_PART);
-    buffer_append_string_encoded(back, CONST_BUF_LEN(&r->uri.path),
+    buffer_append_string_encoded(back, BUF_PTR_LEN(&r->uri.path),
                                  ENCODING_REL_URI_PART);
-    if (!buffer_string_is_empty(&r->uri.query)) {
+    if (!buffer_is_blank(&r->uri.query)) {
       #if 1
         /* XXX: why strip auth_cookie_name instead of back_arg_name? */
         /* Strip any auth_cookie_name arguments from the current args */
         query_append_urlencoded(back, &r->uri.query, strip_arg);
       #else
         buffer_append_string_len(back, "?", 1);
-        buffer_append_string_encoded(back, CONST_BUF_LEN(r->uri.query),
+        buffer_append_string_encoded(back, BUF_PTR_LEN(&r->uri.query),
                                      ENCODING_REL_URI_PART);
       #endif
     }
@@ -398,10 +385,10 @@ static int authn_tkt_construct_back_urlencoded(request_st * const r, buffer * co
 static handler_t authn_tkt_redirect(request_st * const r, const mod_authn_tkt_plugin_opts * const opts, const buffer *location, buffer * const back)/*{{{*/
 {
     /* set default redirect URL */
-    if (buffer_string_is_empty(location))
+    if (!location)
         location = opts->auth_login_url;
 
-    if (buffer_string_is_empty(location)) {
+    if (!location) {
         /* Module is not configured unless login_url is set (or guest_login is enabled) */
         log_error(r->conf.errh, __FILE__, __LINE__,
                   "authn_tkt login-url not configured");
@@ -414,33 +401,26 @@ static handler_t authn_tkt_redirect(request_st * const r, const mod_authn_tkt_pl
         return HANDLER_FINISHED;
     }
 
-    if (!buffer_string_is_empty(opts->auth_back_cookie_name)) {
+    buffer * const url =
+      http_header_response_set_ptr(r, HTTP_HEADER_LOCATION,
+                                   CONST_STR_LEN("Location"));
+    buffer_copy_buffer(url, location);
+
+    if (opts->auth_back_cookie_name) {
         /* XXX: should this get an expires param, if configured?
          * (prior code omitted expires for auth_back_cookie_name) */
         send_auth_cookie(r, opts, opts->auth_back_cookie_name, back,
                          log_epoch_secs);
-        http_header_response_set(r, HTTP_HEADER_LOCATION,
-                                 CONST_STR_LEN("Location"),
-                                 CONST_BUF_LEN(location));
     }
-    else if (!buffer_string_is_empty(opts->auth_back_arg_name)) {
+    else if (opts->auth_back_arg_name) {
         /* If auth_back_cookie_name not set, add back arg to querystr */
-        buffer *url = r->tmp_buf;
-        buffer_copy_buffer(url, location);
         buffer_append_string_len(url, strchr(location->ptr,'?') ? "&" : "?", 1);
-        buffer_append_string_buffer(url, opts->auth_back_arg_name);
-        buffer_append_string_len(url, "=", 1);
-        buffer_append_string_buffer(url, back);
-        http_header_response_set(r, HTTP_HEADER_LOCATION,
-                                 CONST_STR_LEN("Location"),
-                                 CONST_BUF_LEN(url));
+        buffer_append_str3(url, BUF_PTR_LEN(opts->auth_back_arg_name),
+                                CONST_STR_LEN("="),
+                                BUF_PTR_LEN(back));
     }
     else {
-      #if 1
-        http_header_response_set(r, HTTP_HEADER_LOCATION,
-                                 CONST_STR_LEN("Location"),
-                                 CONST_BUF_LEN(location));
-      #else
+      #if 0
         /* XXX: should back_cookie_name and back_arg_name be the same? */
         log_error(r->conf.errh, __FILE__, __LINE__,
           "need either auth _tkt back-cookie-name or auth _tkt back-arg-name "
@@ -457,99 +437,50 @@ static handler_t authn_tkt_redirect(request_st * const r, const mod_authn_tkt_pl
 }/*}}}*/
 
 /* Generate a ticket digest string from the given details */
-static void ticket_digest_MD5(authn_tkt *parsed, uint32_t ts, const buffer *secret)/*{{{*/
+static void ticket_digest(authn_tkt *parsed, uint32_t ts, const buffer *secret)/*{{{*/
 {
-    MD5_CTX ctx;
-
-    /* Generate the initial digest */
-    MD5_Init(&ctx);
+    size_t n = 0;
+    struct const_iovec iov[6];
     if (NULL != parsed->addr_buf) {
-        MD5_Update(&ctx,(unsigned char *)CONST_BUF_LEN(parsed->addr_buf));
+        iov[0].iov_base = parsed->addr_buf->ptr;
+        iov[0].iov_len  = buffer_clen(parsed->addr_buf);
+        n = 1;
     }
-    MD5_Update(&ctx, (unsigned char *)&ts, sizeof(ts));
-    MD5_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
-    MD5_Update(&ctx, (unsigned char *)CONST_BUF_LEN(&parsed->uid));
-    if (!buffer_string_is_empty(&parsed->tokens)) {
-        MD5_Update(&ctx, (unsigned char *)CONST_BUF_LEN(&parsed->tokens));
+    iov[n].iov_base     = &ts;
+    iov[n].iov_len      = sizeof(ts);
+    iov[n+1].iov_base   = secret->ptr;
+    iov[n+1].iov_len    = buffer_clen(secret);
+    iov[n+2].iov_base   = &parsed->uid;
+    iov[n+2].iov_len    = buffer_clen(&parsed->uid);
+    n += 3;
+
+    if (!buffer_is_blank(&parsed->tokens)) {
+        iov[0].iov_base = parsed->tokens.ptr;
+        iov[0].iov_len  = buffer_clen(&parsed->tokens);
+        ++n;
     }
-    if (!buffer_string_is_empty(&parsed->user_data)) {
-        MD5_Update(&ctx,(unsigned char*)CONST_BUF_LEN(&parsed->user_data));
+    if (!buffer_is_blank(&parsed->user_data)) {
+        iov[0].iov_base = parsed->user_data.ptr;
+        iov[0].iov_len  = buffer_clen(&parsed->user_data);
+        ++n;
     }
-    MD5_Final(parsed->digest, &ctx);
+    parsed->digest_fn(parsed->digest, iov, n);
 
     /* Generate the second digest */
-    MD5_Init(&ctx);
-    MD5_Update(&ctx, parsed->digest, parsed->digest_len);
-    MD5_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
-    MD5_Final(parsed->digest, &ctx);
+    iov[0].iov_base     = parsed->digest;
+    iov[0].iov_len      = parsed->digest_len;
+    iov[1].iov_base     = secret->ptr;
+    iov[1].iov_len      = buffer_clen(secret);
+    parsed->digest_fn(parsed->digest, iov, 2);
 }/*}}}*/
-
-#ifdef USE_LIB_CRYPTO_SHA256
-static void ticket_digest_SHA256(authn_tkt *parsed, uint32_t ts, const buffer *secret)/*{{{*/
-{
-    SHA256_CTX ctx;
-
-    /* Generate the initial digest */
-    SHA256_Init(&ctx);
-    if (NULL != parsed->addr_buf) {
-        SHA256_Update(&ctx,(unsigned char *)CONST_BUF_LEN(parsed->addr_buf));
-    }
-    SHA256_Update(&ctx, (unsigned char *)&ts, sizeof(ts));
-    SHA256_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
-    SHA256_Update(&ctx, (unsigned char *)CONST_BUF_LEN(&parsed->uid));
-    if (!buffer_string_is_empty(&parsed->tokens)) {
-        SHA256_Update(&ctx, (unsigned char *)CONST_BUF_LEN(&parsed->tokens));
-    }
-    if (!buffer_string_is_empty(&parsed->user_data)) {
-        SHA256_Update(&ctx,(unsigned char*)CONST_BUF_LEN(&parsed->user_data));
-    }
-    SHA256_Final(parsed->digest, &ctx);
-
-    /* Generate the second digest */
-    SHA256_Init(&ctx);
-    SHA256_Update(&ctx, parsed->digest, parsed->digest_len);
-    SHA256_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
-    SHA256_Final(parsed->digest, &ctx);
-}/*}}}*/
-#endif
-
-#ifdef SHA512_DIGEST_LENGTH
-static void ticket_digest_SHA512(authn_tkt *parsed, uint32_t ts, const buffer *secret)/*{{{*/
-{
-    SHA512_CTX ctx;
-
-    /* Generate the initial digest */
-    SHA512_Init(&ctx);
-    if (NULL != parsed->addr_buf) {
-        SHA512_Update(&ctx,(unsigned char *)CONST_BUF_LEN(parsed->addr_buf));
-    }
-    SHA512_Update(&ctx, (unsigned char *)&ts, sizeof(ts));
-    SHA512_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
-    SHA512_Update(&ctx, (unsigned char *)CONST_BUF_LEN(&parsed->uid));
-    if (!buffer_string_is_empty(&parsed->tokens)) {
-        SHA512_Update(&ctx, (unsigned char *)CONST_BUF_LEN(&parsed->tokens));
-    }
-    if (!buffer_string_is_empty(&parsed->user_data)) {
-        SHA512_Update(&ctx,(unsigned char*)CONST_BUF_LEN(&parsed->user_data));
-    }
-    SHA512_Final(parsed->digest, &ctx);
-
-    /* Generate the second digest */
-    SHA512_Init(&ctx);
-    SHA512_Update(&ctx, parsed->digest, parsed->digest_len);
-    SHA512_Update(&ctx, (unsigned char *)CONST_BUF_LEN(secret));
-    SHA512_Final(parsed->digest, &ctx);
-}/*}}}*/
-#endif
 
 /* Refresh the auth cookie if timeout refresh is set */
 static void refresh_cookie(request_st * const r, const mod_authn_tkt_plugin_opts * const opts, authn_tkt * const parsed)/*{{{*/
 {
-    time_t now = log_epoch_secs;
+    unix_time64_t now = log_epoch_secs;
     uint32_t ts = htonl((uint32_t)now);
     char sep[2] = { SEPARATOR, '\0' };
     buffer *ticket = r->tmp_buf, *ticket_base64 = &parsed->tmp_buf;
-    digest_fn_t ticket_digest = parsed->digest_fn;
 
     ticket_digest(parsed, ts, opts->auth_secret);
     buffer_clear(ticket);
@@ -557,18 +488,15 @@ static void refresh_cookie(request_st * const r, const mod_authn_tkt_plugin_opts
                                         parsed->digest_len);
     /*(ensure 8 hex chars emitted for 4 bytes of uint32_t)*/
     buffer_append_string_encoded_hex_lc(ticket, (char *)&ts, sizeof(ts));
-    buffer_append_string_buffer(ticket, &parsed->uid);
-    if (!buffer_string_is_empty(&parsed->tokens)) {
-        buffer_append_string_len(ticket, sep, 1);
-        buffer_append_string_buffer(ticket, &parsed->tokens);
-    }
-    buffer_append_string_len(ticket, sep, 1);
-    buffer_append_string_buffer(ticket, &parsed->user_data);
+    buffer_append_buffer(ticket, &parsed->uid);
+    if (!buffer_is_blank(&parsed->tokens))
+        buffer_append_str2(ticket, sep, 1, BUF_PTR_LEN(&parsed->tokens));
+    buffer_append_str2(ticket, sep, 1, BUF_PTR_LEN(&parsed->user_data));
 
     buffer_clear(ticket_base64);
     buffer_append_base64_encode(ticket_base64,
                                 (unsigned char *)ticket->ptr,
-                                buffer_string_length(ticket),
+                                buffer_clen(ticket),
                                 BASE64_STANDARD);
 
     send_auth_cookie(r, opts, opts->auth_cookie_name, ticket_base64, now);
@@ -580,17 +508,14 @@ static void refresh_cookie(request_st * const r, const mod_authn_tkt_plugin_opts
  */
 static int check_digest(const mod_authn_tkt_plugin_opts * const opts, authn_tkt * const auth_rec)/*{{{*/
 {
-    digest_fn_t ticket_digest = auth_rec->digest_fn;
     const size_t len = auth_rec->digest_len;
-    unsigned char digest[MAX_DIGEST_LENGTH];
+    unsigned char digest[MD_DIGEST_LENGTH_MAX];
     memcpy(digest, auth_rec->digest, len);
 
     ticket_digest(auth_rec, auth_rec->timestamp, opts->auth_secret);
 
-    if (http_auth_const_time_memeq((char *)digest,
-                                   (char *)auth_rec->digest, len)) {
+    if (ck_memeq_const_time_fixed_len(digest, auth_rec->digest, len))
         return 1;
-    }
 
   #if 0 /*(debug)*/
     buffer_clear(&auth_rec->tmp_buf);
@@ -607,10 +532,9 @@ static int check_digest(const mod_authn_tkt_plugin_opts * const opts, authn_tkt 
               auth_rec->tmp_buf.ptr, tb->ptr);
   #endif
 
-    if (!buffer_string_is_empty(opts->auth_secret_old)) {
+    if (opts->auth_secret_old) {
         ticket_digest(auth_rec, auth_rec->timestamp, opts->auth_secret_old);
-        if (http_auth_const_time_memeq((char *)digest,
-                                       (char *)auth_rec->digest, len)) {
+        if (ck_memeq_const_time_fixed_len(digest, auth_rec->digest, len)) {
             auth_rec->refresh_cookie = 1;
             return 1;
         }
@@ -621,10 +545,10 @@ static int check_digest(const mod_authn_tkt_plugin_opts * const opts, authn_tkt 
 
 /* Check whether or not the given timestamp has timed out
  * Returns 0 if timed out, 1 if OK, 2 if OK and trigger cookie refresh */
-static int check_timeout(const mod_authn_tkt_plugin_opts * const opts, authn_tkt * const parsed, const time_t now)/*{{{*/
+static int check_timeout(const mod_authn_tkt_plugin_opts * const opts, authn_tkt * const parsed, const unix_time64_t now)/*{{{*/
 {
-    const time_t hts = (time_t)ntohl(parsed->timestamp);
-    time_t expire = (TIME_T_MAX - hts > opts->auth_timeout)
+    const unix_time64_t hts = (unix_time64_t)ntohl(parsed->timestamp);
+    unix_time64_t expire = (TIME_T_MAX - hts > opts->auth_timeout)
       ? hts + opts->auth_timeout
       : TIME_T_MAX;
 
@@ -642,7 +566,7 @@ static int check_timeout(const mod_authn_tkt_plugin_opts * const opts, authn_tkt
 __attribute_pure__
 static int match_tokens(const array * const reqtokens, const buffer * const tokens)/*{{{*/
 {
-    const char * const end = tokens->ptr+buffer_string_length(tokens);
+    const char * const end = tokens->ptr+buffer_clen(tokens);
     for (const char *delim, *tok = tokens->ptr; tok < end; tok = delim+1) {
         const size_t len =
           (size_t)(((delim = strchr(tok,',')) ? delim : (delim=end)) - tok);
@@ -678,7 +602,7 @@ static void init_guest_auth_rec(const mod_authn_tkt_plugin_opts * const opts, au
     if (opts->auth_guest_cookie) auth_rec->refresh_cookie = 1;
     buffer_clear(&auth_rec->user_data);
     buffer_clear(&auth_rec->tokens);
-    if (buffer_string_is_empty(opts->auth_guest_user)) {
+    if (!opts->auth_guest_user) {
         buffer_copy_string_len(&auth_rec->uid,
                                CONST_STR_LEN(DEFAULT_GUEST_USER));
     }
@@ -709,7 +633,7 @@ static void init_guest_auth_rec(const mod_authn_tkt_plugin_opts * const opts, au
                 continue;
             }
         }
-        e = u->ptr + buffer_string_length(u);
+        e = u->ptr + buffer_clen(u);
         if (e - b) buffer_append_string_len(&auth_rec->uid, b, (size_t)(e - b));
     }
 }/*}}}*/
@@ -740,7 +664,7 @@ static handler_t mod_authn_tkt_check(request_st * const r, void *p_d, const stru
         }
     }
 
-    auth_rec->addr_buf = opts->auth_ignore_ip ? NULL : r->con->dst_addr_buf;
+    auth_rec->addr_buf = opts->auth_ignore_ip ? NULL : &r->con->dst_addr_buf;
     auth_rec->refresh_cookie = 0;
     auth_rec->digest_fn = opts->auth_digest_fn;
     auth_rec->digest_len = opts->auth_digest_len;
@@ -752,7 +676,7 @@ static handler_t mod_authn_tkt_check(request_st * const r, void *p_d, const stru
      *   - either found (accept) or empty (reset/login) */
     if (authn_tkt_from_querystring(r, p) || authn_tkt_from_cookie(r, p)) {
         /* module is misconfigured unless secret is set */
-        if (buffer_string_is_empty(opts->auth_secret)) {
+        if (!opts->auth_secret) {
             log_error(r->conf.errh, __FILE__, __LINE__, "need secret");
             r->http_status = 500;
             return HANDLER_FINISHED;
@@ -769,7 +693,7 @@ static handler_t mod_authn_tkt_check(request_st * const r, void *p_d, const stru
             if (!(init_guest = opts->auth_guest_fallback)) {
                 const buffer *redirect_url = opts->auth_timeout_url;
                 if (r->http_method == HTTP_METHOD_POST
-                    && !buffer_string_is_empty(opts->auth_post_timeout_url)) {
+                    && opts->auth_post_timeout_url) {
                     redirect_url = opts->auth_post_timeout_url;
                 }
                 /* Delete cookie (set expired) in case we want to set from url*/
@@ -806,11 +730,11 @@ static handler_t mod_authn_tkt_check(request_st * const r, void *p_d, const stru
     if (auth_rec->refresh_cookie) refresh_cookie(r, opts, auth_rec);
 
     /* set CGI/FCGI/SCGI environment */ /* XXX: ? set AUTH_TYPE="authn_tkt" ? */
-    http_auth_setenv(r, CONST_BUF_LEN(&auth_rec->uid), CONST_STR_LEN("Basic"));
+    http_auth_setenv(r, BUF_PTR_LEN(&auth_rec->uid), CONST_STR_LEN("Basic"));
     http_header_env_set(r, CONST_STR_LEN("REMOTE_USER_DATA"),
-                           CONST_BUF_LEN(&auth_rec->user_data));
+                           BUF_PTR_LEN(&auth_rec->user_data));
     http_header_env_set(r, CONST_STR_LEN("REMOTE_USER_TOKENS"),
-                           CONST_BUF_LEN(&auth_rec->tokens));
+                           BUF_PTR_LEN(&auth_rec->tokens));
     return HANDLER_GO_ON;  /* access granted */
 }/*}}}*/
 
@@ -820,7 +744,7 @@ static char *convert_to_seconds(const buffer * const cfg, int * const timeout)/*
     char *endptr;
     unsigned long int n, m;
 
-    if (buffer_string_is_empty(cfg)) {
+    if (buffer_is_blank(cfg)) {
         return "bad time string - must not be empty";
     }
 
@@ -860,7 +784,7 @@ static void plugin_config_init_defaults(mod_authn_tkt_plugin_opts * const opts) 
     opts->auth_cookie_secure = -1;
     opts->auth_timeout = DEFAULT_TIMEOUT_SEC;
     opts->auth_timeout_refresh = DEFAULT_TIMEOUT_SEC / 2;
-    opts->auth_digest_fn = ticket_digest_MD5;
+    opts->auth_digest_fn  = MD5_iov;
     opts->auth_digest_len = MD5_DIGEST_LENGTH;
     opts->auth_cookie_name = &default_auth_cookie_name;
 }/*}}}*/
@@ -952,25 +876,31 @@ static int parse_opts(server * const srv, mod_authn_tkt_plugin_opts * const opts
     for (; -1 != cpv->k_id; ++cpv) {
         switch (cpv->k_id) {
           case 0: /* secret */
-            opts->auth_secret = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_secret = cpv->v.b;
             break;
           case 1: /* secret-old */
-            opts->auth_secret_old = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_secret_old = cpv->v.b;
             break;
           case 2: /* login-url */
-            opts->auth_login_url = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_login_url = cpv->v.b;
             break;
           case 3: /* timeout-url */
-            opts->auth_timeout_url = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_timeout_url = cpv->v.b;
             break;
           case 4: /* post-timeout-url */
-            opts->auth_post_timeout_url = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_post_timeout_url = cpv->v.b;
             break;
           case 5: /* unauth-url */
-            opts->auth_unauth_url = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_unauth_url = cpv->v.b;
             break;
           case 6: /* timeout */
-            if (!buffer_string_is_empty(cpv->v.b)) {
+            if (!buffer_is_blank(cpv->v.b)) {
                 const char * const msg =
                   convert_to_seconds(cpv->v.b, &opts->auth_timeout);
                 if (msg) {
@@ -980,25 +910,24 @@ static int parse_opts(server * const srv, mod_authn_tkt_plugin_opts * const opts
             }
             break;
           case 7: /* timeout-refresh */
-            auth_timeout_refresh_conf = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                auth_timeout_refresh_conf = cpv->v.b;
             break;
           case 8: /* digest-type */
-            if (!buffer_string_is_empty(cpv->v.b)) {
-                /* MAX_DIGEST_LENGTH must be defined at top of file
-                 * to largest supported digest */
+            if (!buffer_is_blank(cpv->v.b)) {
                 if (buffer_eq_slen(cpv->v.b, CONST_STR_LEN("MD5"))) {
-                    opts->auth_digest_fn = ticket_digest_MD5;
+                    opts->auth_digest_fn  = MD5_iov;
                     opts->auth_digest_len = MD5_DIGEST_LENGTH;
                 }
               #ifdef USE_LIB_CRYPTO_SHA256
                 else if (buffer_eq_slen(cpv->v.b, CONST_STR_LEN("SHA256"))) {
-                    opts->auth_digest_fn = ticket_digest_SHA256;
+                    opts->auth_digest_fn  = SHA256_iov;
                     opts->auth_digest_len = SHA256_DIGEST_LENGTH;
                 }
               #endif
               #ifdef SHA512_DIGEST_LENGTH
                 else if (buffer_eq_slen(cpv->v.b, CONST_STR_LEN("SHA512"))) {
-                    opts->auth_digest_fn = ticket_digest_SHA512;
+                    opts->auth_digest_fn  = SHA512_iov;
                     opts->auth_digest_len = SHA512_DIGEST_LENGTH;
                 }
               #endif
@@ -1031,13 +960,15 @@ static int parse_opts(server * const srv, mod_authn_tkt_plugin_opts * const opts
             opts->auth_cookie_secure = (0 != cpv->v.u);
             break;
           case 12:/* cookie-name */
-            opts->auth_cookie_name = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_cookie_name = cpv->v.b;
             break;
           case 13:/* cookie-domain */
-            opts->auth_cookie_domain = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_cookie_domain = cpv->v.b;
             break;
           case 14:/* cookie-expires */
-            if (!buffer_string_is_empty(cpv->v.b)) {
+            if (!buffer_is_blank(cpv->v.b)) {
                  const char * const msg =
                   convert_to_seconds(cpv->v.b, &opts->auth_cookie_expires);
                 if (msg) {
@@ -1048,13 +979,16 @@ static int parse_opts(server * const srv, mod_authn_tkt_plugin_opts * const opts
             }
             break;
           case 15:/* back-cookie-name */
-            opts->auth_back_cookie_name = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_back_cookie_name = cpv->v.b;
             break;
           case 16:/* back-arg-name */
-            opts->auth_back_arg_name = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_back_arg_name = cpv->v.b;
             break;
           case 17:/* guest-user */
-            opts->auth_guest_user = cpv->v.b;
+            if (!buffer_is_blank(cpv->v.b))
+                opts->auth_guest_user = cpv->v.b;
             break;
           case 18:/* guest-login */
             opts->auth_guest_login = (0 != cpv->v.u);
@@ -1104,7 +1038,7 @@ static int parse_opts(server * const srv, mod_authn_tkt_plugin_opts * const opts
         }
     }
 
-    if (!buffer_string_is_empty(auth_timeout_refresh_conf)) {
+    if (auth_timeout_refresh_conf) {
         /* The timeout refresh is a double between 0 and 1, signifying what
          * proportion of the timeout should be left before we refresh i.e.
          * 0 means never refresh (hard timeouts); 1 means always refresh;
