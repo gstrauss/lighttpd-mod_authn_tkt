@@ -11,7 +11,7 @@
  *           License: Apache License 1.0
  */
 /*
- * mod_authn_tkt version 0.03
+ * mod_authn_tkt version 0.04
  */
 #include "first.h"
 
@@ -986,21 +986,18 @@ static int parse_opts(server * const srv, mod_authn_tkt_plugin_opts * const opts
             if (!buffer_string_is_empty(cpv->v.b)) {
                 /* MAX_DIGEST_LENGTH must be defined at top of file
                  * to largest supported digest */
-                if (0 == buffer_is_equal_string(cpv->v.b,
-                                                CONST_STR_LEN(""))) {
+                if (buffer_eq_slen(cpv->v.b, CONST_STR_LEN("MD5"))) {
                     opts->auth_digest_fn = ticket_digest_MD5;
                     opts->auth_digest_len = MD5_DIGEST_LENGTH;
                 }
               #ifdef USE_LIB_CRYPTO_SHA256
-                else if (0 == buffer_is_equal_string(cpv->v.b,
-                                                     CONST_STR_LEN("SHA256"))) {
+                else if (buffer_eq_slen(cpv->v.b, CONST_STR_LEN("SHA256"))) {
                     opts->auth_digest_fn = ticket_digest_SHA256;
                     opts->auth_digest_len = SHA256_DIGEST_LENGTH;
                 }
               #endif
               #ifdef SHA512_DIGEST_LENGTH
-                else if (0 == buffer_is_equal_string(cpv->v.b,
-                                                     CONST_STR_LEN("SHA512"))) {
+                else if (buffer_eq_slen(cpv->v.b, CONST_STR_LEN("SHA512"))) {
                     opts->auth_digest_fn = ticket_digest_SHA512;
                     opts->auth_digest_len = SHA512_DIGEST_LENGTH;
                 }
