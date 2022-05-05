@@ -442,26 +442,26 @@ static void ticket_digest(authn_tkt *parsed, uint32_t ts, const buffer *secret)/
     size_t n = 0;
     struct const_iovec iov[6];
     if (NULL != parsed->addr_buf) {
-        iov[0].iov_base = parsed->addr_buf->ptr;
-        iov[0].iov_len  = buffer_clen(parsed->addr_buf);
-        n = 1;
+        iov[n].iov_base = parsed->addr_buf->ptr;
+        iov[n].iov_len  = buffer_clen(parsed->addr_buf);
+        ++n;
     }
     iov[n].iov_base     = &ts;
     iov[n].iov_len      = sizeof(ts);
     iov[n+1].iov_base   = secret->ptr;
     iov[n+1].iov_len    = buffer_clen(secret);
-    iov[n+2].iov_base   = &parsed->uid;
+    iov[n+2].iov_base   = parsed->uid.ptr;
     iov[n+2].iov_len    = buffer_clen(&parsed->uid);
     n += 3;
 
     if (!buffer_is_blank(&parsed->tokens)) {
-        iov[0].iov_base = parsed->tokens.ptr;
-        iov[0].iov_len  = buffer_clen(&parsed->tokens);
+        iov[n].iov_base = parsed->tokens.ptr;
+        iov[n].iov_len  = buffer_clen(&parsed->tokens);
         ++n;
     }
     if (!buffer_is_blank(&parsed->user_data)) {
-        iov[0].iov_base = parsed->user_data.ptr;
-        iov[0].iov_len  = buffer_clen(&parsed->user_data);
+        iov[n].iov_base = parsed->user_data.ptr;
+        iov[n].iov_len  = buffer_clen(&parsed->user_data);
         ++n;
     }
     parsed->digest_fn(parsed->digest, iov, n);
