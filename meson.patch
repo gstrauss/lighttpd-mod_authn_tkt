@@ -1,0 +1,31 @@
+diff --git a/meson_options.txt b/meson_options.txt
+index 3b9f366b..73db4271 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -166,3 +166,9 @@ option('moduledir',
+ 	value: 'lib/lighttpd',
+ 	description: 'Location to install modules to (relative to prefix)',
+ )
++
++option('with_authn_tkt',
++	type: 'boolean',
++	value: false,
++	description: 'Enable the authn_tkt module',
++)
+diff --git a/src/meson.build b/src/meson.build
+index 4ee16346..b26258f2 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -1090,6 +1090,12 @@ if get_option('with_sasl')
+ 	]
+ endif
+ 
++if get_option('with_authn_tkt')
++	modules += [
++		[ 'mod_authn_tkt', [ 'mod_authn_tkt.c' ] ],
++	]
++endif
++
+ foreach mod: modules
+ 	mod_name = mod.get(0)
+ 	mod_sources = mod.get(1)
