@@ -1,5 +1,5 @@
 /*
- * mod_authn_tkt - a cookie-based authentification for Lighttpd
+ * mod_authn_tkt - a cookie-based authentication for Lighttpd
  *
  * lighttpd module
  *   Copyright Glenn Strauss gstrauss@gluelogic.com
@@ -11,7 +11,7 @@
  *           License: Apache License 1.0
  */
 /*
- * mod_authn_tkt version 0.05
+ * mod_authn_tkt version 0.06
  */
 #include "first.h"
 
