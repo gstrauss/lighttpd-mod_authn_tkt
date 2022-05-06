@@ -1,9 +1,11 @@
-$(LIGHTTPD) is the root of lighttpd sources
+${LIGHTTPD} is the root of lighttpd sources
 
-If using Autotools:
+e.g. LIGHTTPD=/path/to/lighttpd.git/
 
-1) cp mod_authn_tkt.c Makefile.am.patch $(LIGHTTPD)/src
-2) cd $(LIGHTTPD)/src
+If building using Autotools:
+
+1) cp mod_authn_tkt.c Makefile.am.patch ${LIGHTTPD}/src
+2) cd ${LIGHTTPD}/src
 3) patch Makefile.am Makefile.am.patch
 4) rm Makefile.am.patch
 5) cd ..
@@ -11,11 +13,14 @@ If using Autotools:
 
 Then, the usual ./configure; make; make install
 
-Or if using meson:
-1) cp mod_authn_tkt.c $(LIGHTTPD)/src/
-2) cp meson.patch $(LIGHTTPD)/
-3) cd $(LIGHTTPD)
+
+If building using meson:
+
+1) cp mod_authn_tkt.c ${LIGHTTPD}/src/
+2) cp meson.patch ${LIGHTTPD}/
+3) cd ${LIGHTTPD}
 4) patch -p1 < meson.patch
 5) rm meson.patch
 
-Then the usual meson -Dwith_authn_tkt=true; ninja; ninja install
+Then the usual
+  meson -Dwith_authn_tkt=true build; cd build; ninja; ninja install
