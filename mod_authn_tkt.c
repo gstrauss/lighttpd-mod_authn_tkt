@@ -109,7 +109,7 @@ INIT_FUNC(mod_authn_tkt_init) /*{{{*/
 {
     static http_auth_scheme_t http_auth_scheme_authn_tkt = { "authn_tkt", mod_authn_tkt_check, NULL };
 
-    mod_authn_tkt_plugin_data *p = calloc(1, sizeof(*p));
+    mod_authn_tkt_plugin_data *p = ck_calloc(1, sizeof(*p));
 
     /* register http_auth_scheme_* */
     http_auth_scheme_authn_tkt.p_d = p;
@@ -1080,8 +1080,7 @@ SETDEFAULTS_FUNC(mod_authn_tkt_set_defaults) /*{{{*/
               case 0: /* auth.method.tkt.opts */
                 if (cpv->v.a->used) {
                     mod_authn_tkt_plugin_opts * const x =
-                      calloc(1, sizeof(mod_authn_tkt_plugin_opts));
-                    force_assert(x);
+                      ck_calloc(1, sizeof(mod_authn_tkt_plugin_opts));
                     const array * const a = cpv->v.a;
                     cpv->vtype = T_CONFIG_LOCAL;
                     cpv->v.v = x;
