@@ -8,16 +8,22 @@
  * based on: mod_auth_tkt by Gavin Carr with contributors
  *           (see http://www.openfusion.com.au/labs/mod_auth_tkt),
  *           https://github.com/gavincarr/mod_auth_tkt
- *           License: Apache License 1.0
+ *           License: Apache License 2.0
  */
 /*
- * mod_authn_tkt version 0.06
+ * mod_authn_tkt version 0.07
  */
 #include "first.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifndef _WIN32
+#include <arpa/inet.h>  /* htonl() ntohl() */
+#else
+#include <winsock2.h>   /* htonl() ntohl() */
+#endif
 
 #include "sys-crypto-md.h"
 
